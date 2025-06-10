@@ -22,7 +22,7 @@
     "react-quill": "^2.0.0",
     "react-router-dom": "^6.22.1",
     "react-scripts": "5.0.1",
-    "tinymce": "6.7.0",
+    "tinymce": "7.2.0",
     "uuid": "^11.0.5",
     "web-vitals": "^2.1.4"
   },
