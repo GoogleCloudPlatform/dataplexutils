@@ -10,7 +10,7 @@
     "@mui/icons-material": "^5.15.10",
     "@mui/lab": "^5.0.0-alpha.165",
     "@mui/material": "^5.15.10",
-    "@tinymce/tinymce-react": "4.3.0",
+    "@tinymce/tinymce-react": "4.3.2",
     "@types/react-router-dom": "^5.3.3",
     "@types/uuid": "^10.0.0",
     "axios": "^1.7.9",
@@ -22,7 +22,7 @@
     "react-quill": "^2.0.0",
     "react-router-dom": "^6.22.1",
     "react-scripts": "5.0.1",
-    "tinymce": "6.7.0",
+    "tinymce": "8.6.0",
     "uuid": "^11.0.5",
     "web-vitals": "^2.1.4"
   },
