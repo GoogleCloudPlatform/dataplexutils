@@ -42,6 +42,12 @@ import FilterAltIcon from '@mui/icons-material/FilterAlt';
 import { Task } from '../components/TaskTracker';
 import { v4 as uuidv4 } from 'uuid';
 import { DatplexConfig } from '../App';
+import {
+  extractApiErrorMessage,
+  getApiBaseUrl,
+  getAxiosRequestConfig,
+  getStoredApiToken,
+} from '../utils/apiClient';
 
 interface ClientOptionsSettings {
   use_lineage_tables: boolean;
@@ -51,6 +57,7 @@ interface ClientOptionsSettings {
   use_ext_documents: boolean;
   persist_to_dataplex_catalog: boolean;
   stage_for_review: boolean;
+  dry_run: boolean;
   top_values_in_description: boolean;
   description_handling: 'append' | 'replace' | 'prepend';
   description_prefix: string;
@@ -83,12 +90,19 @@ interface RegenerationCounts {
 
 interface GenerationPageProps {
   config: DatplexConfig;
+  apiToken?: string;
   onTaskAdd: (task: Task) => void;
   onTaskUpdate: (taskId: string, updates: Partial<Task>) => void;
   onConfigChange: (config: DatplexConfig) => void;
 }
 
-const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTaskUpdate, onConfigChange }) => {
+const GenerationPage: React.FC<GenerationPageProps> = ({
+  config,
+  apiToken,
+  onTaskAdd,
+  onTaskUpdate,
+  onConfigChange,
+}) => {
   const [apiUrlBase, setApiUrlBase] = useState<string>('');
   const [apiResponse, setApiResponse] = useState<any>(null);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
@@ -99,9 +113,24 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
 
   useEffect(() => {
     // Initialize API URL
-    const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-    setApiUrlBase(apiUrl);
+    setApiUrlBase(getApiBaseUrl());
   }, []);
+
+  const buildClientOptionsSettings = (): ClientOptionsSettings => ({
+    use_lineage_tables: config.use_lineage_tables,
+    use_lineage_processes: config.use_lineage_processes,
+    use_profile: config.use_profile,
+    use_data_quality: config.use_data_quality,
+    use_ext_documents: config.use_ext_documents,
+    persist_to_dataplex_catalog: config.persist_to_dataplex_catalog,
+    stage_for_review: config.stage_for_review,
+    dry_run: Boolean(config.dry_run),
+    top_values_in_description: config.top_values_in_description,
+    description_handling: config.description_handling as ClientOptionsSettings['description_handling'],
+    description_prefix: config.description_prefix,
+  });
+
+  const normalizedBaseUrl = () => (apiUrlBase || getApiBaseUrl()).replace(/\/+$/, '');
 
   const handleInputChange = (event: ChangeEvent<HTMLInputElement>) => {
     const { name, value, type, checked } = event.target;
@@ -201,18 +230,7 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
           llm_location: config.llm_location,
           dataplex_location: config.dataplex_location,
         },
-        client_options_settings: {
-          use_lineage_tables: config.use_lineage_tables,
-          use_lineage_processes: config.use_lineage_processes,
-          use_profile: config.use_profile,
-          use_data_quality: config.use_data_quality,
-          use_ext_documents: config.use_ext_documents,
-          persist_to_dataplex_catalog: config.persist_to_dataplex_catalog,
-          stage_for_review: config.stage_for_review,
-          top_values_in_description: config.top_values_in_description,
-          description_handling: config.description_handling,
-          description_prefix: config.description_prefix,
-        },
+        client_options_settings: buildClientOptionsSettings(),
         table_settings: {
           project_id: config.project_id,
           dataset_id: config.dataset_id,
@@ -230,8 +248,9 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
       console.log('Sending request with payload:', requestPayload);
 
       const response = await axios.post(
-        `${apiUrlBase}/${endpoint}`,
-        requestPayload
+        `${normalizedBaseUrl()}/${endpoint}`,
+        requestPayload,
+        getAxiosRequestConfig(apiToken)
       );
 
       console.log('Received response:', response.data);
@@ -239,12 +258,7 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
       onTaskUpdate(taskId, { status: 'completed' });
     } catch (error) {
       console.error('API Error:', error);
-      let errorMessage = 'An error occurred while calling the API.';
-      
-      if (axios.isAxiosError(error)) {
-        console.error('Response data:', error.response?.data);
-        errorMessage = `API Error: ${error.response?.data?.detail || error.message}`;
-      }
+      const errorMessage = `API Error: ${extractApiErrorMessage(error, 'An error occurred while calling the API.')}`;
       
       setError(errorMessage);
       onTaskUpdate(taskId, { 
@@ -294,7 +308,11 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
       
       console.log('Sending regeneration counts request with payload:', requestPayload);
       
-      const response = await axios.post(`${apiUrlBase}/get_regeneration_counts`, requestPayload);
+      const response = await axios.post(
+        `${normalizedBaseUrl()}/get_regeneration_counts`,
+        requestPayload,
+        getAxiosRequestConfig(apiToken)
+      );
       
       // Update regeneration counts from response
       setRegenerationCounts({
@@ -305,15 +323,10 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
       onTaskUpdate(taskId, { status: 'completed' });
     } catch (error) {
       console.error('API Error:', error);
-      let countsErrorMessage = 'Failed to fetch regeneration counts.';
-      
-      // Extract more specific error message if available
-      if (axios.isAxiosError(error) && error.response) {
-        const responseData = error.response.data;
-        if (responseData && responseData.detail) {
-          countsErrorMessage = `Failed to fetch regeneration counts: ${responseData.detail}`;
-        }
-      }
+      const detail = extractApiErrorMessage(error, '');
+      const countsErrorMessage = detail
+        ? `Failed to fetch regeneration counts: ${detail}`
+        : 'Failed to fetch regeneration counts.';
       
       setError(countsErrorMessage);
       onTaskUpdate(taskId, { 
@@ -343,37 +356,34 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
 
     try {
       setError(null);
-      await axios.post(`${apiUrlBase}/regenerate_all`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
+      const response = await axios.post(
+        `${normalizedBaseUrl()}/regenerate_all`,
+        {
+          client_settings: {
+            project_id: config.project_id,
+            llm_location: config.llm_location,
+            dataplex_location: config.dataplex_location,
+          },
+          client_options_settings: buildClientOptionsSettings(),
+          dataset_settings: {
+            project_id: config.project_id,
+            dataset_id: config.dataset_id,
+            documentation_csv_uri: config.documentation_csv_uri,
+            strategy: config.strategy
+          }
         },
-        client_options_settings: {
-          use_lineage_tables: config.use_lineage_tables,
-          use_lineage_processes: config.use_lineage_processes,
-          use_profile: config.use_profile,
-          use_data_quality: config.use_data_quality,
-          use_ext_documents: config.use_ext_documents,
-          persist_to_dataplex_catalog: config.persist_to_dataplex_catalog,
-          stage_for_review: config.stage_for_review,
-          top_values_in_description: config.top_values_in_description,
-          description_handling: config.description_handling,
-          description_prefix: config.description_prefix,
-        },
-        dataset_settings: {
-          project_id: config.project_id,
-          dataset_id: config.dataset_id,
-          documentation_csv_uri: config.documentation_csv_uri,
-          strategy: config.strategy
-        }
-      });
+        getAxiosRequestConfig(apiToken)
+      );
+      if (response?.data) {
+        setApiResponse(response.data);
+      }
       onTaskUpdate(taskId, { status: 'completed' });
       // Refresh counts after regeneration
       handleGetRegenerationCounts();
     } catch (error) {
       console.error('API Error:', error);
-      const errorMessage = 'Failed to trigger regeneration.';
+      const detail = extractApiErrorMessage(error, 'Failed to trigger regeneration.');
+      const errorMessage = detail.startsWith('Failed') ? detail : `Failed to trigger regeneration: ${detail}`;
       setError(errorMessage);
       onTaskUpdate(taskId, { 
         status: 'failed',
@@ -404,40 +414,37 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
 
     try {
       setError(null);
-      await axios.post(`${apiUrlBase}/regenerate_selected`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
+      const response = await axios.post(
+        `${normalizedBaseUrl()}/regenerate_selected`,
+        {
+          client_settings: {
+            project_id: config.project_id,
+            llm_location: config.llm_location,
+            dataplex_location: config.dataplex_location,
+          },
+          client_options_settings: buildClientOptionsSettings(),
+          dataset_settings: {
+            project_id: config.project_id,
+            dataset_id: config.dataset_id,
+            documentation_csv_uri: config.documentation_csv_uri,
+            strategy: config.strategy
+          },
+          regeneration_request: {
+            objects: [tablePattern]
+          }
         },
-        client_options_settings: {
-          use_lineage_tables: config.use_lineage_tables,
-          use_lineage_processes: config.use_lineage_processes,
-          use_profile: config.use_profile,
-          use_data_quality: config.use_data_quality,
-          use_ext_documents: config.use_ext_documents,
-          persist_to_dataplex_catalog: config.persist_to_dataplex_catalog,
-          stage_for_review: config.stage_for_review,
-          top_values_in_description: config.top_values_in_description,
-          description_handling: config.description_handling,
-          description_prefix: config.description_prefix,
-        },
-        dataset_settings: {
-          project_id: config.project_id,
-          dataset_id: config.dataset_id,
-          documentation_csv_uri: config.documentation_csv_uri,
-          strategy: config.strategy
-        },
-        regeneration_request: {
-          objects: [tablePattern]
-        }
-      });
+        getAxiosRequestConfig(apiToken)
+      );
+      if (response?.data) {
+        setApiResponse(response.data);
+      }
       onTaskUpdate(taskId, { status: 'completed' });
       // Refresh counts after regeneration
       handleGetRegenerationCounts();
     } catch (error) {
       console.error('API Error:', error);
-      const errorMessage = 'Failed to trigger selective regeneration.';
+      const detail = extractApiErrorMessage(error, 'Failed to trigger selective regeneration.');
+      const errorMessage = detail.startsWith('Failed') ? detail : `Failed to trigger selective regeneration: ${detail}`;
       setError(errorMessage);
       onTaskUpdate(taskId, { 
         status: 'failed',
@@ -558,6 +565,12 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
                   helperText="This text will be added before the generated description"
                 />
               </FormControl>
+
+              {config.description_handling === 'replace' && (
+                <Alert severity="warning">
+                  Replace mode overwrites existing descriptions and may be blocked by server policy unless explicitly enabled.
+                </Alert>
+              )}
             </Box>
           </Paper>
 
@@ -589,6 +602,16 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
               <FormControlLabel
                 control={
                   <Checkbox
+                    name="client_options_settings.dry_run"
+                    checked={Boolean(config.dry_run)}
+                    onChange={handleInputChange}
+                  />
+                }
+                label="Dry Run (Preview Only - No Metadata Writes)"
+              />
+              <FormControlLabel
+                control={
+                  <Checkbox
                     name="client_options_settings.top_values_in_description"
                     checked={config.top_values_in_description}
                     onChange={handleInputChange}
@@ -596,6 +619,11 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
                 }
                 label="Include Top Values in Description"
               />
+              {!config.stage_for_review && !config.dry_run && (
+                <Alert severity="warning" sx={{ mt: 1 }}>
+                  Stage for Review is disabled; direct BigQuery metadata writes may be rejected by backend security policy.
+                </Alert>
+              )}
             </Box>
           </Paper>
         </Grid>
@@ -660,7 +688,7 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
                 >
                   <MenuItem value="NAIVE">Naive</MenuItem>
                   <MenuItem value="DOCUMENTED">Documented</MenuItem>
-                  <MenuItem value="DOCUMENTED_AND_REST">Documented and Rest</MenuItem>
+                  <MenuItem value="DOCUMENTED_THEN_REST">Documented Then Rest</MenuItem>
                 </Select>
               </FormControl>
             </Box>
@@ -670,12 +698,21 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
             <Typography variant="h2" gutterBottom>
               API Configuration
             </Typography>
-            <TextField
-              label="API Base URL"
-              value={apiUrlBase}
-              onChange={(e) => setApiUrlBase(e.target.value)}
-              fullWidth
-            />
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <TextField
+                label="API Base URL"
+                value={apiUrlBase}
+                onChange={(e) => setApiUrlBase(e.target.value)}
+                fullWidth
+              />
+              <Alert
+                severity={(apiToken !== undefined ? apiToken : getStoredApiToken()).trim() ? 'info' : 'warning'}
+              >
+                {(apiToken !== undefined ? apiToken : getStoredApiToken()).trim()
+                  ? 'API key (X-API-Key) is configured for this session.'
+                  : 'No API key configured. Set your X-API-Key token on the Configuration page before calling protected endpoints.'}
+              </Alert>
+            </Box>
           </Paper>
         </Grid>
 
@@ -732,10 +769,72 @@ const GenerationPage: React.FC<GenerationPageProps> = ({ config, onTaskAdd, onTa
               </Alert>
             )}
 
-            {apiResponse && !('regeneration_counts' in apiResponse) && apiResponse.status === 'success' && (
-              <Alert severity="success" sx={{ mb: 3 }}>
-                {apiResponse.message}
-              </Alert>
+            {apiResponse && !('regeneration_counts' in apiResponse) && (
+              apiResponse.dry_run === true || apiResponse.preview || apiResponse.dry_run_preview ? (() => {
+                const previewData =
+                  apiResponse.preview && typeof apiResponse.preview === 'object'
+                    ? apiResponse.preview
+                    : apiResponse.dry_run_preview && typeof apiResponse.dry_run_preview === 'object'
+                      ? apiResponse.dry_run_preview
+                      : apiResponse;
+                return (
+                  <Box sx={{ mb: 3 }}>
+                    <Alert severity="info" sx={{ mb: 2 }}>
+                      Dry Run Preview — No BigQuery or Dataplex metadata was modified.
+                      {apiResponse.message ? ` ${apiResponse.message}` : ''}
+                    </Alert>
+                    <Paper variant="outlined" sx={{ p: 2, backgroundColor: '#fafafa' }}>
+                      <Typography variant="subtitle1" gutterBottom>
+                        Dry-Run Result
+                      </Typography>
+                      {previewData.table_fqn && (
+                        <Typography variant="body2" sx={{ mb: 1 }}>
+                          <strong>Table:</strong> {String(previewData.table_fqn)}
+                        </Typography>
+                      )}
+                      {previewData.previous_description !== undefined && (
+                        <Box sx={{ mb: 1 }}>
+                          <Typography variant="body2" fontWeight="bold">
+                            Previous Description:
+                          </Typography>
+                          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                            {previewData.previous_description || '(empty)'}
+                          </Typography>
+                        </Box>
+                      )}
+                      {previewData.proposed_description !== undefined && (
+                        <Box sx={{ mb: 1 }}>
+                          <Typography variant="body2" fontWeight="bold">
+                            Proposed Description:
+                          </Typography>
+                          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                            {previewData.proposed_description || '(empty)'}
+                          </Typography>
+                        </Box>
+                      )}
+                      <Box
+                        component="pre"
+                        sx={{
+                          m: 0,
+                          mt: 1,
+                          p: 1.5,
+                          backgroundColor: '#f0f0f0',
+                          borderRadius: 1,
+                          overflow: 'auto',
+                          maxHeight: 320,
+                          fontSize: '0.8rem',
+                        }}
+                      >
+                        {JSON.stringify(previewData, null, 2)}
+                      </Box>
+                    </Paper>
+                  </Box>
+                );
+              })() : (apiResponse.status === 'success' || apiResponse.message) ? (
+                <Alert severity="success" sx={{ mb: 3 }}>
+                  {apiResponse.message || 'Generation completed successfully.'}
+                </Alert>
+              ) : null
             )}
           </Paper>
         </Grid>

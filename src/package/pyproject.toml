@@ -33,5 +33,6 @@ dependencies = [
     "google-cloud-datacatalog==3.19.0",
     "google-cloud-datacatalog-lineage==0.3.6",
     "google-cloud-dataplex==2.3.1",
+    "google-cloud-storage>=2.16.0",
     "google-cloud-aiplatform>=1.48.0"
 ]

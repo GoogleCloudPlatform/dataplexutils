@@ -65,6 +65,8 @@ import { useCache } from '../contexts/CacheContext';
 import { useReview, MetadataItem as ReviewContextMetadataItem } from '../contexts/ReviewContext';
 import ReactDiffViewer, { DiffMethod } from 'react-diff-viewer-continued';
 import VisibilityIcon from '@mui/icons-material/Visibility';
+import { extractApiErrorMessage, getApiBaseUrl, getAxiosRequestConfig } from '../utils/apiClient';
+import { escapeHtmlText, sanitizeHtml, stripHtmlToText } from '../utils/sanitizeHtml';
 
 interface Comment {
   id: string;
@@ -86,6 +88,7 @@ interface ReviewPageProps {
     description_handling?: string;
     description_prefix?: string;
   };
+  apiToken?: string;
 }
 
 // Extend the MetadataItem interface
@@ -98,7 +101,7 @@ interface MetadataItem extends ReviewContextMetadataItem {
   columns?: any[]; // +++ Add optional columns array for cached table data +++
 }
 
-const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
+const ReviewPage: React.FC<ReviewPageProps> = ({ config, apiToken }) => {
   const { detailsCache, setDetailsCache, clearCache } = useCache();
   const { state, dispatch } = useReview();
   const { items = [], pageToken, totalCount, currentItemIndex, viewMode, hasLoadedItems } = state;
@@ -129,9 +132,10 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
 
   // Initialize API URL
   useEffect(() => {
-    const apiUrl = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-    setApiUrlBase(apiUrl);
+    setApiUrlBase(getApiBaseUrl());
   }, []);
+
+  const normalizedBaseUrl = () => (apiUrlBase || getApiBaseUrl()).replace(/\/+$/, '');
 
   // Sync column navigation state with current item
   useEffect(() => {
@@ -432,41 +436,46 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
       
       const endpoint = isColumn ? 'accept_column_draft_description' : 'accept_table_draft_description';
       
-      await axios.post(`${apiUrlBase}/${endpoint}`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
+      await axios.post(
+        `${normalizedBaseUrl()}/${endpoint}`,
+        {
+          client_settings: {
+            project_id: config.project_id,
+            llm_location: config.llm_location,
+            dataplex_location: config.dataplex_location,
+          },
+          client_options_settings: {
+            use_lineage_tables: false,
+            use_lineage_processes: false,
+            use_profile: false,
+            use_data_quality: false,
+            use_ext_documents: false,
+            persist_to_dataplex_catalog: true,
+            stage_for_review: false,
+            dry_run: false,
+            top_values_in_description: true,
+            description_handling: config.description_handling || 'append',
+            description_prefix: config.description_prefix || '---AI Generated description---'
+          },
+          table_settings: {
+            project_id: projectId,
+            dataset_id: datasetId,
+            table_id: tableId,
+            documentation_uri: item.metadata?.external_document_uri || item.externalDocumentUri || ""
+          },
+          dataset_settings: {
+            project_id: projectId,
+            dataset_id: datasetId,
+            documentation_csv_uri: "",
+            strategy: "NAIVE"
+          },
+          column_settings: isColumn ? {
+              column_name: columnName
+          } : undefined,
+          column_name: columnName
         },
-        client_options_settings: {
-          use_lineage_tables: false,
-          use_lineage_processes: false,
-          use_profile: false,
-          use_data_quality: false,
-          use_ext_documents: false,
-          persist_to_dataplex_catalog: true,
-          stage_for_review: false,
-          top_values_in_description: true,
-          description_handling: config.description_handling || 'append',
-          description_prefix: config.description_prefix || '---AI Generated description---'
-        },
-        table_settings: {
-          project_id: projectId,
-          dataset_id: datasetId,
-          table_id: tableId,
-          documentation_uri: item.metadata?.external_document_uri || item.externalDocumentUri || ""
-        },
-        dataset_settings: {
-          project_id: projectId,
-          dataset_id: datasetId,
-          documentation_csv_uri: "",
-          strategy: "NAIVE"
-        },
-        column_settings: isColumn ? {
-            column_name: columnName
-        } : undefined,
-        column_name: columnName
-      });
+        getAxiosRequestConfig(apiToken)
+      );
 
       // Check if the user navigated away while the API call was in progress
       const currentlyDisplayedItemIdAfterAPI = isColumnView ? 
@@ -660,75 +669,100 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
 
   // Separate handler for editing in review mode
   const handleEditInReview = (item: MetadataItem) => {
-    // Ensure we're editing the correct item (table or column)
+    // Ensure we're editing the correct item (table or column) and sync rich-text mode safely
+    const inferredType: 'table' | 'column' =
+      item.type === 'column' || item.id?.includes('#column.') ? 'column' : 'table';
+    const initialRich = Boolean(item.isHtml);
+    setIsRichText(initialRich);
     setEditItem({
       ...item,
-      type: item.type, // Preserve the type (table or column)
-      id: item.id // Preserve the full ID which includes column info if it's a column
+      type: inferredType, // Preserve or infer the type (table or column)
+      id: item.id, // Preserve the full ID which includes column info if it's a column
+      draftDescription: initialRich
+        ? sanitizeHtml(item.draftDescription || '')
+        : (item.draftDescription || ''),
     });
     setEditDialogOpen(true);
   };
 
+  const handleCloseEditDialog = () => {
+    setEditDialogOpen(false);
+    setEditItem(null);
+    setIsRichText(false);
+  };
+
   const handleSaveEdit = async () => {
     if (editItem) {
-    try {
-      setError(null);
-      
-      const tableFqn = editItem.id.split('#')[0];
-      const [projectId, datasetId, tableId] = tableFqn.split('.');
-        const isColumn = editItem.type === 'column';
-      const columnName = isColumn ? editItem.id.split('#column.')[1] : undefined;
-      
-      const endpoint = isColumn ? 'update_column_draft_description' : 'update_table_draft_description';
-      
-        await axios.post(`${apiUrlBase}/${endpoint}`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
-        },
-        table_settings: {
-          project_id: projectId,
-          dataset_id: datasetId,
-          table_id: tableId,
-          documentation_uri: editItem.metadata?.external_document_uri || editItem.externalDocumentUri || ""
-        },
-        description: editItem.draftDescription,
-        is_html: isRichText,
-        column_name: columnName
-      });
-      
-        // Update both state and cache with the new description
+      try {
+        setError(null);
+
+        const isColumn = editItem.type === 'column' || editItem.id.includes('#column.');
+        if (isColumn) {
+          // Backend (src/backend_apis/main.py) currently provides /update_table_draft_description
+          // only and lacks /update_column_draft_description. Fail safely without mutating local state.
+          setError(
+            'Updating column draft descriptions is not supported by the backend API (/update_column_draft_description is not implemented).'
+          );
+          return;
+        }
+
+        const tableFqn = editItem.id.split('#')[0];
+        const [projectId, datasetId, tableId] = tableFqn.split('.');
+        const finalDescription = isRichText
+          ? sanitizeHtml(editItem.draftDescription || '')
+          : (editItem.draftDescription || '');
+
+        await axios.post(
+          `${normalizedBaseUrl()}/update_table_draft_description`,
+          {
+            client_settings: {
+              project_id: config.project_id,
+              llm_location: config.llm_location,
+              dataplex_location: config.dataplex_location,
+            },
+            table_settings: {
+              project_id: projectId,
+              dataset_id: datasetId,
+              table_id: tableId,
+              documentation_uri: editItem.metadata?.external_document_uri || editItem.externalDocumentUri || ""
+            },
+            description: finalDescription,
+            is_html: isRichText,
+          },
+          getAxiosRequestConfig(apiToken)
+        );
+
+        // Update both state and cache with the new sanitized description
         const updatedItem = {
           ...editItem,
-          draftDescription: editItem.draftDescription,
+          draftDescription: finalDescription,
+          isHtml: isRichText,
           lastModified: new Date().toISOString()
         };
 
-      dispatch({
-        type: 'UPDATE_ITEM',
-        payload: {
-          id: editItem.id,
+        dispatch({
+          type: 'UPDATE_ITEM',
+          payload: {
+            id: editItem.id,
             updates: updatedItem
-        }
-      });
-      
+          }
+        });
+
         // Update cache
-      setDetailsCache(prev => ({
-        ...prev,
-        [editItem.id]: {
-          ...prev[editItem.id],
+        setDetailsCache(prev => ({
+          ...prev,
+          [editItem.id]: {
+            ...prev[editItem.id],
             ...updatedItem
-        }
-      }));
-      
-      setEditDialogOpen(false);
-      setEditItem(null);
-      
+          }
+        }));
+
+        handleCloseEditDialog();
+
         // Refresh the item details to get the updated state
         await loadItemDetails(editItem.id, true);
       } catch (err) {
-        setError('Failed to save changes. Please try again.');
+        setError(extractApiErrorMessage(err, 'Failed to save changes. Please try again.'));
         console.error('Error saving description:', err);
       }
     }
@@ -781,24 +815,28 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
 
       console.log('handleAddComment: Making API call with:', { projectId, datasetId, tableIdBase, columnName });
 
-      await axios.post(`${apiUrlBase}/metadata/review/add_comment`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
+      await axios.post(
+        `${normalizedBaseUrl()}/metadata/review/add_comment`,
+        {
+          client_settings: {
+            project_id: config.project_id,
+            llm_location: config.llm_location,
+            dataplex_location: config.dataplex_location,
+          },
+          table_settings: {
+            project_id: projectId,
+            dataset_id: datasetId,
+            table_id: tableIdBase, // Use base table ID for API
+          },
+          column_settings: isColumn ? {
+            column_name: columnName
+          } : undefined,
+          comment: newComment,
+          column_name: columnName, // API expects this redundant field
+          is_column_comment: isColumn
         },
-        table_settings: {
-          project_id: projectId,
-          dataset_id: datasetId,
-          table_id: tableIdBase, // Use base table ID for API
-        },
-        column_settings: isColumn ? {
-          column_name: columnName
-        } : undefined,
-        comment: newComment,
-        column_name: columnName, // API expects this redundant field
-        is_column_comment: isColumn
-      });
+        getAxiosRequestConfig(apiToken)
+      );
 
       console.log('handleAddComment: API call successful.');
 
@@ -1005,20 +1043,24 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
 
       // Make the API call
       console.log('Making API call with:', { tableFqn, columnName });
-      const response = await axios.post(`${apiUrlBase}/mark_for_regeneration`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
+      const response = await axios.post(
+        `${normalizedBaseUrl()}/mark_for_regeneration`,
+        {
+          client_settings: {
+            project_id: config.project_id,
+            llm_location: config.llm_location,
+            dataplex_location: config.dataplex_location,
+          },
+          request: {
+            table_fqn: tableFqn,
+            column_name: columnName
+          },
+          column_settings: isColumn ? {
+            column_name: columnName
+          } : undefined
         },
-        request: {
-          table_fqn: tableFqn,
-          column_name: columnName
-        },
-        column_settings: isColumn ? {
-          column_name: columnName
-        } : undefined
-      });
+        getAxiosRequestConfig(apiToken)
+      );
 
       console.log('Mark for regeneration response:', response.data);
       
@@ -1189,26 +1231,47 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
   };
 
   const truncateHtml = (html: string, maxLength: number = 150) => {
-    // Remove HTML tags for length calculation
-    const div = document.createElement('div');
-    div.innerHTML = html;
-    const text = div.textContent || div.innerText || '';
-    
-    if (text.length <= maxLength) return html;
-    
-    // Truncate text and add ellipsis
+    const text = stripHtmlToText(html);
+
+    if (text.length <= maxLength) {
+      return sanitizeHtml(html);
+    }
+
     const truncated = text.slice(0, maxLength) + '...';
-    return `<div>${truncated}</div>`;
+    return `<p>${escapeHtmlText(truncated)}</p>`;
   };
 
   const renderDescription = (description: string, isHtml: boolean, truncate: boolean = false) => {
     if (!description) return null;
-    
-    const content = truncate ? truncateHtml(description) : description;
-    
+
+    if (!isHtml) {
+      const displayText =
+        truncate && description.length > 150
+          ? `${description.slice(0, 150)}...`
+          : description;
+      return (
+        <Box
+          sx={{
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            ...(truncate && {
+              maxHeight: '100px',
+              display: '-webkit-box',
+              WebkitLineClamp: 3,
+              WebkitBoxOrient: 'vertical',
+            })
+          }}
+        >
+          <Typography>{displayText}</Typography>
+        </Box>
+      );
+    }
+
+    const safeContent = sanitizeHtml(truncate ? truncateHtml(description) : description);
+
     return (
       <Box 
-        dangerouslySetInnerHTML={{ __html: content }}
+        dangerouslySetInnerHTML={{ __html: safeContent }}
         sx={{ 
           '& p': { margin: '0.5em 0' },
           '& ul, & ol': { marginLeft: '1.5em' },
@@ -1227,14 +1290,8 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
   };
 
   const renderDescriptionWithDiff = (currentDescription: string, draftDescription: string, isHtml: boolean) => {
-    // Strip HTML tags if the content is HTML
-    const stripHtml = (html: string) => {
-      const doc = new DOMParser().parseFromString(html, 'text/html');
-      return doc.body.textContent || '';
-    };
-
-    const oldText = isHtml ? stripHtml(currentDescription || '') : currentDescription || '';
-    const newText = isHtml ? stripHtml(draftDescription || '') : draftDescription || '';
+    const oldText = isHtml ? stripHtmlToText(currentDescription || '') : currentDescription || '';
+    const newText = isHtml ? stripHtmlToText(draftDescription || '') : draftDescription || '';
 
     // If there are no changes, show a message indicating this
     const hasChanges = oldText !== newText;
@@ -1310,7 +1367,7 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
               <Typography variant="h6" gutterBottom>Current Version</Typography>
               <Paper sx={{ p: 2, minHeight: '200px' }}>
                 {isHtml ? (
-                  <div dangerouslySetInnerHTML={{ __html: currentDescription || 'No description available' }} />
+                  <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(currentDescription || 'No description available') }} />
                 ) : (
                   <Typography>{currentDescription || 'No description available'}</Typography>
                 )}
@@ -1320,7 +1377,7 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
               <Typography variant="h6" gutterBottom>Draft Version</Typography>
               <Paper sx={{ p: 2, minHeight: '200px', bgcolor: hasChanges ? 'rgba(200, 250, 205, 0.15)' : undefined }}>
                 {isHtml ? (
-                  <div dangerouslySetInnerHTML={{ __html: draftDescription || 'No draft description available' }} />
+                  <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(draftDescription || 'No draft description available') }} />
                 ) : (
                   <Typography>{draftDescription || 'No draft description available'}</Typography>
                 )}
@@ -2079,19 +2136,23 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
       const [projectId, datasetId, tableIdBase] = currentTableId.replace('#table', '').split('.');
       const columnName = isColumn ? itemId.split('#column.')[1] : undefined;
 
-      const response = await axios.post(`${apiUrlBase}/metadata/review/details`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
+      const response = await axios.post(
+        `${normalizedBaseUrl()}/metadata/review/details`,
+        {
+          client_settings: {
+            project_id: config.project_id,
+            llm_location: config.llm_location,
+            dataplex_location: config.dataplex_location,
+          },
+          table_settings: {
+            project_id: projectId,
+            dataset_id: datasetId,
+            table_id: tableIdBase, // Use base ID for API
+          },
+          // API fetches table details even when asking for a column, we extract later
         },
-        table_settings: {
-          project_id: projectId,
-          dataset_id: datasetId,
-          table_id: tableIdBase, // Use base ID for API
-        },
-        // API fetches table details even when asking for a column, we extract later
-      });
+        getAxiosRequestConfig(apiToken)
+      );
 
       const details = response.data; // This is always the full table details from API
       console.log('[loadItemDetails] Received raw details from API:', details);
@@ -2673,7 +2734,7 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
                     <Typography variant="h6" gutterBottom>Current Version</Typography>
                     <Paper sx={{ p: 2, minHeight: '200px' }}>
                       {displayItem.isHtml ? (
-                        <div dangerouslySetInnerHTML={{ __html: displayItem.currentDescription || 'No description available' }} />
+                        <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(displayItem.currentDescription || 'No description available') }} />
                       ) : (
                         <Typography>{displayItem.currentDescription || 'No description available'}</Typography>
                       )}
@@ -2683,7 +2744,7 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
                     <Typography variant="h6" gutterBottom>Draft Version</Typography>
                     <Paper sx={{ p: 2, minHeight: '200px', bgcolor: hasChanges ? 'rgba(200, 250, 205, 0.15)' : undefined }}>
                       {displayItem.isHtml ? (
-                        <div dangerouslySetInnerHTML={{ __html: displayItem.draftDescription || 'No draft description available' }} />
+                        <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(displayItem.draftDescription || 'No draft description available') }} />
                       ) : (
                         <Typography>{displayItem.draftDescription || 'No draft description available'}</Typography>
                       )}
@@ -2806,9 +2867,9 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
     const content = toRichText
       ? description
           .split('\n')
-          .map(line => `<p>${line}</p>`)
+          .map(line => `<p>${escapeHtmlText(line)}</p>`)
           .join('')
-      : description.replace(/<[^>]*>/g, '');
+      : stripHtmlToText(description);
     
     handleEditorChange(content);
     setIsRichText(toRichText);
@@ -2821,20 +2882,24 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
       console.log('[fetchReviewItems] Starting fetch...'); // <-- Add log
       console.log('Fetching review items...');
       
-      const response = await axios.post(`${apiUrlBase}/metadata/review`, {
-        client_settings: {
-          project_id: config.project_id,
-          llm_location: config.llm_location,
-          dataplex_location: config.dataplex_location,
+      const response = await axios.post(
+        `${normalizedBaseUrl()}/metadata/review`,
+        {
+          client_settings: {
+            project_id: config.project_id,
+            llm_location: config.llm_location,
+            dataplex_location: config.dataplex_location,
+          },
+          dataset_settings: {
+            project_id: config.project_id,
+            dataset_id: config.dataset_id || "",
+            documentation_csv_uri: "",
+            strategy: "NAIVE"
+          }
+          // Add page_token logic here if/when pagination is implemented
         },
-        dataset_settings: {
-          project_id: config.project_id,
-          dataset_id: config.dataset_id || "",
-          documentation_csv_uri: "",
-          strategy: "NAIVE"
-        }
-        // Add page_token logic here if/when pagination is implemented
-      });
+        getAxiosRequestConfig(apiToken)
+      );
 
       console.log('[fetchReviewItems] Received response:', response.data); // <-- Add log
       console.log('Received response:', response.data);
@@ -2998,7 +3063,7 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
 
       <Dialog
         open={editDialogOpen}
-        onClose={() => setEditDialogOpen(false)}
+        onClose={handleCloseEditDialog}
         maxWidth="md"
         fullWidth
       >
@@ -3021,7 +3086,7 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
                   const description = editItem?.draftDescription;
                   if (isRichText && description) {
                     // Convert HTML to plain text
-                    const plainText = description.replace(/<[^>]*>/g, '');
+                    const plainText = stripHtmlToText(description);
                     handleEditorChange(plainText);
                   }
                   setIsRichText(false);
@@ -3036,11 +3101,13 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
                 onClick={() => {
                   const description = editItem?.draftDescription;
                   if (!isRichText && description) {
-                    // Convert plain text to basic HTML
-                    const htmlContent = description
-                      .split('\n')
-                      .map(line => `<p>${line}</p>`)
-                      .join('');
+                    // Convert plain text to basic HTML safely
+                    const htmlContent = sanitizeHtml(
+                      description
+                        .split('\n')
+                        .map(line => `<p>${escapeHtmlText(line)}</p>`)
+                        .join('')
+                    );
                     handleEditorChange(htmlContent);
                   }
                   setIsRichText(true);
@@ -3053,12 +3120,17 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
           </Box>
         </DialogTitle>
         <DialogContent>
+          {(editItem?.type === 'column' || editItem?.id?.includes('#column.')) && (
+            <Alert severity="warning" sx={{ mt: 1, mb: 2 }}>
+              Editing column draft descriptions cannot be saved because the backend API does not implement /update_column_draft_description.
+            </Alert>
+          )}
           {editItem && (
             <Box sx={{ pt: 2 }}>
           {isRichText ? (
             <ReactQuill
                   theme="snow"
-                  value={editItem.draftDescription}
+                  value={sanitizeHtml(editItem.draftDescription || '')}
               onChange={handleEditorChange}
                   modules={{
                     toolbar: [
@@ -3096,8 +3168,12 @@ const ReviewPage: React.FC<ReviewPageProps> = ({ config }) => {
           )}
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setEditDialogOpen(false)}>Cancel</Button>
-          <Button onClick={handleSaveEdit} variant="contained">
+          <Button onClick={handleCloseEditDialog}>Cancel</Button>
+          <Button
+            onClick={handleSaveEdit}
+            variant="contained"
+            disabled={editItem?.type === 'column' || editItem?.id?.includes('#column.')}
+          >
             Save
           </Button>
         </DialogActions>

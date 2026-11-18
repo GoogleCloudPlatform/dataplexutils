@@ -22,6 +22,55 @@ import {
   TextField, Button, FormControlLabel, Checkbox, Box, Select, MenuItem, InputLabel
 } from '@mui/material';
 
+const API_TOKEN_SESSION_KEY = 'metadata_wizard_api_token';
+
+function getInitialApiToken() {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const stored = window.sessionStorage.getItem(API_TOKEN_SESSION_KEY);
+      if (stored !== null) {
+        return stored;
+      }
+    }
+  } catch (e) {
+    // Ignore storage errors in restricted contexts.
+  }
+  if (
+    typeof process !== 'undefined' &&
+    process.env &&
+    typeof process.env.REACT_APP_API_TOKEN === 'string' &&
+    process.env.REACT_APP_API_TOKEN.trim() !== ''
+  ) {
+    return process.env.REACT_APP_API_TOKEN.trim();
+  }
+  return '';
+}
+
+function saveSessionApiToken(token) {
+  const normalized = typeof token === 'string' ? token.trim() : '';
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      if (normalized) {
+        window.sessionStorage.setItem(API_TOKEN_SESSION_KEY, normalized);
+      } else {
+        const hasEnvToken =
+          typeof process !== 'undefined' &&
+          process.env &&
+          typeof process.env.REACT_APP_API_TOKEN === 'string' &&
+          process.env.REACT_APP_API_TOKEN.trim() !== '';
+        if (hasEnvToken) {
+          window.sessionStorage.setItem(API_TOKEN_SESSION_KEY, '');
+        } else {
+          window.sessionStorage.removeItem(API_TOKEN_SESSION_KEY);
+        }
+      }
+    }
+  } catch (e) {
+    // Ignore storage errors in restricted contexts.
+  }
+  return normalized;
+}
+
 function App() {
   const [params, setParams] = useState({
     client_options_settings: {
@@ -31,8 +80,11 @@ function App() {
       use_data_quality: false,
       use_ext_documents: false,
       persist_to_dataplex_catalog: true,
-      stage_for_review: false,
+      stage_for_review: true,
+      dry_run: false,
       top_values_in_description: true,
+      description_handling: 'append',
+      description_prefix: '---AI Generated description---',
     },
     client_settings: {
       project_id: '',
@@ -50,15 +102,18 @@ function App() {
       project_id: '',
       dataset_id: '',
       documentation_csv_uri: '',
-      strategy: '1'
+      strategy: 'NAIVE'
     },
   });
 
-  const [apiUrlBase, setApiUrlBase] = useState(null);
+  const [apiUrlBase, setApiUrlBase] = useState(
+    () => (typeof process !== 'undefined' && process.env && process.env.REACT_APP_API_URL) || 'http://localhost:8000'
+  );
+  const [apiToken, setApiToken] = useState(() => getInitialApiToken());
   const [apiResponse, setApiResponse] = useState(null);
 
   const [persistToDataplex, setPersistToDataplex] = useState(true);
-  const [stageForReview, setStageForReview] = useState(false);
+  const [stageForReview, setStageForReview] = useState(true);
 
   const [isGenerating, setIsGenerating] = useState(false);
 
@@ -67,6 +122,9 @@ function App() {
 
     if (name === "apiUrlBase") {
       setApiUrlBase(value);
+    } else if (name === "apiToken") {
+      saveSessionApiToken(value);
+      setApiToken(value);
     } else {
       const [parent, child] = name.split('.');
 
@@ -119,6 +177,7 @@ function App() {
 
   const callApi = async (endpoint) => {
     try {
+      const baseUrl = (apiUrlBase || 'http://localhost:8000').replace(/\/+$/, '');
       const requestBody = {
         client_options_settings: {
           use_lineage_tables: params.client_options_settings.use_lineage_tables,
@@ -128,7 +187,10 @@ function App() {
           use_ext_documents: params.client_options_settings.use_ext_documents,
           persist_to_dataplex_catalog: persistToDataplex,
           stage_for_review: stageForReview,
+          dry_run: params.client_options_settings.dry_run,
           top_values_in_description: params.client_options_settings.top_values_in_description,
+          description_handling: params.client_options_settings.description_handling,
+          description_prefix: params.client_options_settings.description_prefix,
         },
         client_settings: {
           project_id: params.client_settings.project_id,
@@ -149,14 +211,17 @@ function App() {
         },
       };
 
+      const trimmedToken = (apiToken || '').trim();
+      const headers = trimmedToken ? { 'X-API-Key': trimmedToken } : {};
 
-      console.log("Sending request to:", `${apiUrlBase}/${endpoint}`);
+      console.log("Sending request to:", `${baseUrl}/${endpoint}`);
       console.log("Request body:", JSON.stringify(requestBody, null, 2));
 
       setIsGenerating(true);
       const response = await axios.post(
-        `${apiUrlBase}/${endpoint}`,
-        requestBody
+        `${baseUrl}/${endpoint}`,
+        requestBody,
+        { headers }
       );
       setApiResponse(response.data);
       setIsGenerating(false);
@@ -171,7 +236,12 @@ function App() {
       } else {
         console.error("Error message:", error.message);
       }
-      setApiResponse({ error: "Network Error or API issue. Check console for details." });
+      const detail = error.response?.data?.detail;
+      setApiResponse({
+        error: detail
+          ? `API Error: ${typeof detail === 'object' ? JSON.stringify(detail) : detail}`
+          : "Network Error or API issue. Check console for details.",
+      });
       setIsGenerating(false);
     }
   };
@@ -250,7 +320,7 @@ function App() {
           >
             <MenuItem value="NAIVE">Naive</MenuItem>
             <MenuItem value="DOCUMENTED">Documented</MenuItem>
-            <MenuItem value="DOCUMENTED_AND_REST">Documented and then rest</MenuItem>
+            <MenuItem value="DOCUMENTED_THEN_REST">Documented then rest</MenuItem>
           </Select>
         </div>
           
@@ -345,13 +415,25 @@ function App() {
         </Box>
 
         <Box className="settings-section">
-          <h2>API backend URL</h2>
+          <h2>API backend URL &amp; Auth</h2>
           <div>
             <TextField
               label="API Base URL"
               name="apiUrlBase"
               value={apiUrlBase}
               onChange={handleChange}
+              fullWidth
+            />
+          </div>
+          <div>
+            <TextField
+              label="API Token (X-API-Key)"
+              name="apiToken"
+              type="password"
+              value={apiToken}
+              onChange={handleChange}
+              autoComplete="off"
+              helperText="Stored in sessionStorage only for this session"
               fullWidth
             />
           </div>
@@ -393,12 +475,44 @@ function App() {
         />
         <FormControlLabel
           control={<Checkbox
+            name="client_options_settings.dry_run"
+            checked={params.client_options_settings.dry_run}
+            onChange={handleChange}
+          />}
+          label="Dry Run (Preview Only - No Metadata Writes)"
+        />
+        <FormControlLabel
+          control={<Checkbox
             name="client_options_settings.top_values_in_description"
             checked={params.client_options_settings.top_values_in_description}
             onChange={handleChange}
           />}
           label="Store top 10 values in column descriptions"
         />
+        <div>
+          <InputLabel id="description-handling-label">Description Handling</InputLabel>
+          <Select
+            labelId="description-handling-label"
+            id="client_options_settings.description_handling"
+            name="client_options_settings.description_handling"
+            value={params.client_options_settings.description_handling}
+            onChange={handleChange}
+            fullWidth
+          >
+            <MenuItem value="append">Append</MenuItem>
+            <MenuItem value="prepend">Prepend</MenuItem>
+            <MenuItem value="replace">Replace</MenuItem>
+          </Select>
+        </div>
+        <div style={{ marginTop: '12px' }}>
+          <TextField
+            label="Description Prefix"
+            name="client_options_settings.description_prefix"
+            value={params.client_options_settings.description_prefix}
+            onChange={handleChange}
+            fullWidth
+          />
+        </div>
       </Box>
 
       {(isGenerating || apiResponse) && (
