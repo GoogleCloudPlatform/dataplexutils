@@ -25,6 +25,7 @@ import ConfigurationPage from './pages/ConfigurationPage';
 import { Task } from './components/TaskTracker';
 import { CacheProvider } from './contexts/CacheContext';
 import { ReviewProvider } from './contexts/ReviewContext';
+import { configureAxiosAuth, getStoredApiToken, saveApiToken } from './utils/apiClient';
 
 export interface DatplexConfig {
   // Client Settings
@@ -40,6 +41,7 @@ export interface DatplexConfig {
   use_ext_documents: boolean;
   persist_to_dataplex_catalog: boolean;
   stage_for_review: boolean;
+  dry_run: boolean;
   top_values_in_description: boolean;
   description_handling: string;
   description_prefix: string;
@@ -68,7 +70,8 @@ function App() {
     use_data_quality: false,
     use_ext_documents: false,
     persist_to_dataplex_catalog: true,
-    stage_for_review: false,
+    stage_for_review: true,
+    dry_run: false,
     top_values_in_description: true,
     description_handling: 'append',
     description_prefix: '---AI Generated description---',
@@ -83,7 +86,17 @@ function App() {
     strategy: 'NAIVE'
   });
 
+  const [apiToken, setApiToken] = useState<string>(() => getStoredApiToken());
   const [tasks, setTasks] = useState<Task[]>([]);
+
+  useEffect(() => {
+    configureAxiosAuth(apiToken);
+  }, [apiToken]);
+
+  const handleApiTokenChange = (token: string) => {
+    const normalized = saveApiToken(token);
+    setApiToken(normalized);
+  };
 
   const handleTaskAdd = (task: Task) => {
     console.log('Adding task:', task);
@@ -183,6 +196,7 @@ function App() {
                     element={
                       <GenerationPage 
                         config={dataplexConfig}
+                        apiToken={apiToken}
                         onTaskAdd={handleTaskAdd}
                         onTaskUpdate={handleTaskUpdate}
                         onConfigChange={setDataplexConfig}
@@ -191,7 +205,7 @@ function App() {
                   />
                   <Route 
                     path="/review" 
-                    element={<ReviewPage config={dataplexConfig} />} 
+                    element={<ReviewPage config={dataplexConfig} apiToken={apiToken} />} 
                   />
                   <Route 
                     path="/configuration" 
@@ -199,6 +213,8 @@ function App() {
                       <ConfigurationPage 
                         config={dataplexConfig} 
                         onConfigChange={setDataplexConfig}
+                        apiToken={apiToken}
+                        onApiTokenChange={handleApiTokenChange}
                       />
                     } 
                   />

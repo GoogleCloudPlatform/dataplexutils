@@ -17,12 +17,13 @@ limitations under the License.
    2024 Google
 """
 # Standard library imports
-import logging
-import toml
-import pkgutil
 import datetime
-import uuid
+import logging
+import pkgutil
+import re
+import toml
 import traceback
+import uuid
 
 # Cloud imports
 from google.cloud import dataplex_v1
@@ -30,15 +31,22 @@ from google.protobuf import field_mask_pb2, struct_pb2
 import google.api_core.exceptions
 from google.protobuf.json_format import MessageToDict
 
+# Local imports
+from .utils import sanitize_llm_output
+
 # Load constants
 constants = toml.loads(pkgutil.get_data(__name__, "constants.toml").decode())
 # Logger
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(constants["LOGGING"]["WIZARD_LOGGER"])
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
+
+_SEARCH_TERM_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,128}\Z")
+_MAX_COMMENT_LENGTH = 2048
+
 
 class ReviewOperations:
     """Review-specific operations."""
@@ -47,77 +55,46 @@ class ReviewOperations:
         """Initialize with reference to main client."""
         self._client = client
 
-    def build_search_query_for_review(self, dataset_fqn: str, search_query: str = None) -> str:
-        """Build an effective query that always includes the dataset filter.
-        
-        This method ensures that the dataset_fqn is always included in the query,
-        even when no search_query is provided. If a search_query is provided,
-        it's combined with the dataset filter.
-        
-        Args:
-            dataset_fqn (str): The fully qualified name of the dataset (project_id.dataset_id)
-            search_query (str, optional): Additional search criteria to filter results
-            
-        Returns:
-            str: The effective query string that includes the dataset filter
-        """
-        # Start with the base system filter
+    def _validate_search_query(self, search_query: str | None) -> str | None:
+        if search_query is None:
+            return None
+        if not isinstance(search_query, str):
+            raise ValueError("Invalid search query.")
+        cleaned = search_query.strip()
+        if not cleaned:
+            return None
+        if cleaned.upper() in {"AND", "OR", "NOT"} or not _SEARCH_TERM_RE.match(cleaned):
+            raise ValueError("Invalid search query filter.")
+        return cleaned
+
+    def _resolve_parent_filter(self, dataset_fqn: str | None) -> str:
+        if dataset_fqn is None or (isinstance(dataset_fqn, str) and not dataset_fqn.strip()):
+            return f"parent:{self._client._project_id}"
+        project_id, dataset_id = self._client._utils.split_dataset_fqn(dataset_fqn)
+        return f"parent:{project_id}.{dataset_id}"
+
+    def build_search_query_for_review(self, dataset_fqn: str = None, search_query: str = None) -> str:
+        """Build an effective query that safely includes the validated dataset/project filter."""
         base_query = f"""system=BIGQUERY and aspect:global.{constants['ASPECT_TEMPLATE']['name']}.is-accepted=false"""
-        
-        # Always include the dataset filter
-        dataset_filter = f"parent:{dataset_fqn}"
-        
-        # Combine filters
-        if search_query is not None:
-            # If search_query already contains the dataset filter, don't duplicate it
-            if f"parent:{dataset_fqn}" in search_query:
-                return f"{base_query} AND {search_query}"
-            else:
-                return f"{base_query} AND {dataset_filter} AND {search_query}"
-        else:
-            return f"{base_query} AND {dataset_filter}"
-        
-    def build_search_query_for_regeneration(self, dataset_fqn: str, search_query: str = None) -> str:
-        """Build an effective query that always includes the dataset filter.
-        
-        This method ensures that the dataset_fqn is always included in the query,
-        even when no search_query is provided. If a search_query is provided,
-        it's combined with the dataset filter.
-        
-        Args:
-            dataset_fqn (str): The fully qualified name of the dataset (project_id.dataset_id)
-            search_query (str, optional): Additional search criteria to filter results
-            
-        Returns:
-            str: The effective query string that includes the dataset filter
-        """
-        # Start with the base system filter
+        dataset_filter = self._resolve_parent_filter(dataset_fqn)
+        cleaned_search = self._validate_search_query(search_query)
+        if cleaned_search is not None:
+            return f"{base_query} AND {dataset_filter} AND {cleaned_search}"
+        return f"{base_query} AND {dataset_filter}"
+
+    def build_search_query_for_regeneration(self, dataset_fqn: str = None, search_query: str = None) -> str:
+        """Build an effective query that safely includes the validated dataset/project filter."""
         base_query = f"""system=BIGQUERY and aspect:global.{constants['ASPECT_TEMPLATE']['name']}.to-be-regenerated=true"""
-        
-        # Always include the dataset filter
-        dataset_filter = f"parent:{dataset_fqn}"
-        
-        # Combine filters
-        if search_query is not None:
-            # If search_query already contains the dataset filter, don't duplicate it
-            if f"parent:{dataset_fqn}" in search_query:
-                return f"{base_query} AND {search_query}"
-            else:
-                return f"{base_query} AND {dataset_filter} AND {search_query}"
-        else:
-            return f"{base_query} AND {dataset_filter}"
+        dataset_filter = self._resolve_parent_filter(dataset_fqn)
+        cleaned_search = self._validate_search_query(search_query)
+        if cleaned_search is not None:
+            return f"{base_query} AND {dataset_filter} AND {cleaned_search}"
+        return f"{base_query} AND {dataset_filter}"
 
     def get_review_items_for_dataset(self, dataset_fqn: str, search_query: str=None, page_size: int = 100, page_token: str = None) -> dict:
-        """Get review items for a dataset based on search criteria.
-
-        Args:
-            search_query (str): Optional search query to filter tables
-            page_size (int): Number of items per page
-            page_token (str): Token for pagination
-
-        Returns:
-            dict: Dictionary containing review items and pagination info
-        """
+        """Get review items for a dataset based on search criteria."""
+        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1 or page_size > 500:
+            raise ValueError("page_size must be between 1 and 500.")
         try:
             logger.info(f"Processing search query: {search_query}")
             
@@ -220,20 +197,15 @@ class ReviewOperations:
             raise
 
     def get_review_item_details(self, table_fqn: str, column_name: str = None) -> dict:
-        """Get detailed information about a specific review item.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table
-            column_name (str, optional): The name of the column
-
-        Returns:
-            dict: Detailed information about the review item
-        """
+        """Get detailed information about a specific review item."""
         try:
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
             project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
-            
-            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(table_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+            safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
+            if column_name is not None:
+                self._client._utils.validate_column_name(column_name)
+
+            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(safe_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
             
             aspect_type = f"""projects/{self._client._project_id}/locations/global/aspectTypes/{constants["ASPECT_TEMPLATE"]["name"]}"""
             aspect_types = [aspect_type]
@@ -492,6 +464,8 @@ class ReviewOperations:
 
             return []
 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Error getting comments for table {table_fqn}: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
@@ -528,27 +502,25 @@ class ReviewOperations:
             
             return []
 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Error getting negative examples for table {table_fqn}: {str(e)}")
             return []
 
     def add_comment_to_table_draft_description(self, table_fqn, comment):
-        """Add a comment to a table's draft description.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table
-            comment (str): The comment to add
-
-        Returns:
-            bool: True if successful
-        """
+        """Add a comment to a table's draft description."""
+        project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
+        safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
+        sanitized_comment = sanitize_llm_output(comment, max_chars=_MAX_COMMENT_LENGTH)
+        if not sanitized_comment:
+            raise ValueError("Comment must be a non-empty string.")
         try:
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
-            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
-            
+
             aspect_type = f"""projects/{self._client._project_id}/locations/global/aspectTypes/{constants["ASPECT_TEMPLATE"]["name"]}"""
             aspect_name = f"""{self._client._project_id}.global.{constants["ASPECT_TEMPLATE"]["name"]}"""
-            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(table_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(safe_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
             
             new_aspect = dataplex_v1.Aspect()
             new_aspect.aspect_type = aspect_type
@@ -567,13 +539,13 @@ class ReviewOperations:
                         aspect_found = True
                         new_aspect.data = entry.aspects[i].data
                         existing_comments = list(new_aspect.data.get("human-comments", []))
-                        existing_comments.append(comment)
+                        existing_comments.append(sanitized_comment)
                         new_aspect.data["human-comments"] = existing_comments
                         break
                 
                 if not aspect_found:
                     aspect_data = {
-                        "human-comments": [comment]
+                        "human-comments": [sanitized_comment]
                     }
                     data_struct = struct_pb2.Struct()
                     data_struct.update(aspect_data)
@@ -581,7 +553,7 @@ class ReviewOperations:
                 
             except google.api_core.exceptions.NotFound:
                 aspect_data = {
-                    "human-comments": [comment]
+                    "human-comments": [sanitized_comment]
                 }
                 data_struct = struct_pb2.Struct()
                 data_struct.update(aspect_data)
@@ -607,25 +579,21 @@ class ReviewOperations:
             return False
 
     def add_comment_to_column_draft_description(self, table_fqn, column_name, comment):
-        """Add a comment to a column's draft description.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table
-            column_name (str): The name of the column
-            comment (str): The comment to add
-
-        Returns:
-            bool: True if successful
-        """
+        """Add a comment to a column's draft description."""
+        project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
+        self._client._utils.validate_column_name(column_name)
+        safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
+        sanitized_comment = sanitize_llm_output(comment, max_chars=_MAX_COMMENT_LENGTH)
+        if not sanitized_comment:
+            raise ValueError("Comment must be a non-empty string.")
         try:
-            logger.info(f"=== START: add_comment_to_column_draft_description for {table_fqn}.{column_name} ===")
-            
+            logger.info(f"=== START: add_comment_to_column_draft_description for {safe_fqn}.{column_name} ===")
+
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
-            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
-            
+
             aspect_type = f"""projects/{self._client._project_id}/locations/global/aspectTypes/{constants["ASPECT_TEMPLATE"]["name"]}"""
             aspect_name = f"""{self._client._project_id}.global.{constants["ASPECT_TEMPLATE"]["name"]}@Schema.{column_name}"""
-            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(table_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(safe_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
 
             new_aspect = dataplex_v1.Aspect()
             new_aspect.aspect_type = aspect_type
@@ -645,13 +613,13 @@ class ReviewOperations:
                         found_aspect = True
                         new_aspect.data = entry.aspects[i].data
                         existing_comments = list(new_aspect.data.get("human-comments", []))
-                        existing_comments.append(comment)
+                        existing_comments.append(sanitized_comment)
                         new_aspect.data["human-comments"] = existing_comments
                         break
                 
                 if not found_aspect:
                     aspect_data = {
-                        "human-comments": [comment]
+                        "human-comments": [sanitized_comment]
                     }
                     data_struct = struct_pb2.Struct()
                     data_struct.update(aspect_data)
@@ -659,7 +627,7 @@ class ReviewOperations:
 
             except google.api_core.exceptions.NotFound:
                 aspect_data = {
-                    "human-comments": [comment]
+                    "human-comments": [sanitized_comment]
                 }
                 data_struct = struct_pb2.Struct()
                 data_struct.update(aspect_data)
@@ -679,9 +647,9 @@ class ReviewOperations:
             response = client.update_entry(request=request)
             logger.info("Successfully updated entry")
             return True
-
+            
         except Exception as e:
-            logger.error(f"Error adding comment to column {column_name} in table {table_fqn}: {str(e)}")
+            logger.error(f"Error adding comment to column {column_name} in table {safe_fqn}: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
 
@@ -719,23 +687,17 @@ class ReviewOperations:
             return None
 
     def _get_column_draft_description(self, table_fqn: str, column_name: str) -> str:
-        """Get the draft description for a column.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table
-            column_name (str): The name of the column
-
-        Returns:
-            str: Draft description or None if not found
-        """
+        """Get the draft description for a column."""
+        project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
+        self._client._utils.validate_column_name(column_name)
+        safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
         try:
             logger.debug(f"Getting draft description for column {column_name}")
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
-            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
 
             aspect_type = f"""projects/{self._client._project_id}/locations/global/aspectTypes/{constants["ASPECT_TEMPLATE"]["name"]}"""
             aspect_types = [aspect_type]
-            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(table_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+            entry_name = f"projects/{project_id}/locations/{self._client._dataplex_ops._get_dataset_location(safe_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
 
             request = dataplex_v1.GetEntryRequest(
                 name=entry_name,
@@ -743,171 +705,132 @@ class ReviewOperations:
                 aspect_types=aspect_types
             )
             entry = client.get_entry(request=request)
-            
+
             logger.debug(f"Available aspects: {list(entry.aspects.keys())}")
-            
-            # Check for column aspects with different patterns
-            aspect_patterns = [
+
+            aspect_suffixes = (
                 f"""global.{constants["ASPECT_TEMPLATE"]["name"]}@Schema.{column_name}""",
                 f"""global.{constants["ASPECT_TEMPLATE"]["name"]}.Schema.{column_name}""",
-                f"""Schema.{column_name}"""
-            ]
-            
-            for pattern in aspect_patterns:
-                for aspect_key, aspect in entry.aspects.items():
-                    if pattern in aspect_key and hasattr(aspect, 'data'):
-                        logger.debug(f"Found aspect for column {column_name}: {aspect_key}")
-                        logger.debug(f"Aspect data: {aspect.data}")
-                        if aspect.data and isinstance(aspect.data, dict) and "contents" in aspect.data:
-                            return aspect.data["contents"]
+            )
+            for aspect_key, aspect in entry.aspects.items():
+                aspect_path = getattr(aspect, "path", "")
+                if (
+                    aspect_key.endswith(aspect_suffixes)
+                    or aspect_path == f"Schema.{column_name}"
+                ) and hasattr(aspect, "data"):
+                    aspect_data = aspect.data
+                    if aspect_data and (isinstance(aspect_data, dict) or hasattr(aspect_data, "get")):
+                        if "contents" in aspect_data:
+                            return aspect_data["contents"]
 
             logger.debug(f"No draft description found for column {column_name}")
             return None
+        except ValueError:
+            raise
         except Exception as e:
-            logger.error(f"Error getting draft description for column {column_name} in table {table_fqn}: {str(e)}")
+            logger.error(f"Error getting draft description for column {column_name} in table {safe_fqn}: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             return None
 
-    def reject_review_item(self, item_id: str) -> dict:
-        """Reject a review item by ID.
-        
-        Args:
-            item_id (str): The ID of the review item to reject
-            
-        Returns:
-            dict: Result of the operation
-        """
-        try:
-            logger.info(f"Rejecting review item with ID: {item_id}")
-            
-            # Parse the item_id to determine if it's a table or column
+    def _parse_review_item_id(self, item_id: str) -> tuple[str, str, str | None]:
+        """Parse and validate a review item ID in '#' or ':' delimited format."""
+        if not isinstance(item_id, str) or not item_id.strip():
+            raise ValueError("Invalid review item ID format.")
+        item_id = item_id.strip()
+
+        item_type = None
+        table_fqn = None
+        column_name = None
+
+        if "#" in item_id:
+            parts = item_id.split("#")
+            if len(parts) == 2 and parts[1] == "table":
+                item_type = "table"
+                table_fqn = parts[0]
+            elif len(parts) == 3 and parts[1] == "column":
+                item_type = "column"
+                table_fqn = parts[0]
+                column_name = parts[2]
+            elif len(parts) == 2 and parts[1].startswith("column."):
+                item_type = "column"
+                table_fqn = parts[0]
+                column_name = parts[1][len("column."):]
+        elif ":" in item_id:
             parts = item_id.split(":")
-            if len(parts) < 2:
-                raise ValueError(f"Invalid item ID format: {item_id}")
-                
-            item_type = parts[0]
-            
-            if item_type == "table":
-                # Format: table:project.dataset.table
-                table_fqn = ":".join(parts[1:])
-                # Mark the table for regeneration
-                self._client._dataplex_ops.mark_table_for_regeneration(table_fqn)
-                return {"success": True, "message": f"Table {table_fqn} marked for regeneration"}
-            elif item_type == "column":
-                # Format: column:project.dataset.table:column_name
+            if len(parts) == 2 and parts[0] == "table":
+                item_type = "table"
+                table_fqn = parts[1]
+            elif len(parts) == 3 and parts[0] == "column":
+                item_type = "column"
                 table_fqn = parts[1]
                 column_name = parts[2]
-                # Mark the column for regeneration
-                self._client._dataplex_ops.mark_column_for_regeneration(table_fqn, column_name)
-                return {"success": True, "message": f"Column {column_name} in table {table_fqn} marked for regeneration"}
-            else:
-                raise ValueError(f"Unknown item type: {item_type}")
-                
+
+        if item_type not in ("table", "column") or not table_fqn:
+            raise ValueError("Invalid review item ID format.")
+
+        project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
+        safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
+        if item_type == "column":
+            self._client._utils.validate_column_name(column_name)
+        return item_type, safe_fqn, column_name
+
+    def reject_review_item(self, item_id: str) -> dict:
+        """Reject a review item by ID."""
+        item_type, table_fqn, column_name = self._parse_review_item_id(item_id)
+        try:
+            logger.info(f"Rejecting review item for {table_fqn}")
+            if item_type == "table":
+                ok = self._client._dataplex_ops.mark_table_for_regeneration(table_fqn)
+                return {
+                    "success": bool(ok),
+                    "message": f"Table {table_fqn} marked for regeneration",
+                }
+            ok = self._client._dataplex_ops.mark_column_for_regeneration(
+                table_fqn, column_name
+            )
+            return {
+                "success": bool(ok),
+                "message": f"Column {column_name} in table {table_fqn} marked for regeneration",
+            }
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Error rejecting review item: {str(e)}")
             logger.error(traceback.format_exc())
-            return {"success": False, "error": str(e)}
-            
+            return {"success": False, "error": "Failed to reject review item."}
+
     def edit_review_item(self, item_id: str, description: str) -> dict:
-        """Edit a review item's description.
-        
-        Args:
-            item_id (str): The ID of the review item to edit
-            description (str): The new description
-            
-        Returns:
-            dict: Result of the operation
-        """
+        """Edit a review item's draft description."""
+        item_type, table_fqn, column_name = self._parse_review_item_id(item_id)
+        if not isinstance(description, str):
+            raise ValueError("Description must be a string.")
+        max_len = (
+            constants["DATA"]["MAX_TABLE_DESC_LENGTH"]
+            if item_type == "table"
+            else constants["DATA"]["MAX_COLUMN_DESC_LENGTH"]
+        )
+        sanitized_desc = sanitize_llm_output(description, max_chars=max_len)
+
         try:
-            logger.info(f"Editing review item with ID: {item_id}")
-            
-            # Parse the item_id to determine if it's a table or column
-            parts = item_id.split(":")
-            if len(parts) < 2:
-                raise ValueError(f"Invalid item ID format: {item_id}")
-                
-            item_type = parts[0]
-            
+            logger.info(f"Editing review item for {table_fqn}")
             if item_type == "table":
-                # Format: table:project.dataset.table
-                table_fqn = ":".join(parts[1:])
-                # Update the table draft description
-                client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
-                
-                # Get the entry
-                entry = self._client._dataplex_ops._get_entry(table_fqn)
-                if not entry:
-                    raise ValueError(f"Entry not found for table: {table_fqn}")
-                
-                # Update the draft description in the entry's aspects
-                aspects = entry.aspects
-                if not aspects:
-                    aspects = {}
-                
-                # Create or update the draft description aspect
-                draft_aspect_name = constants["DATAPLEX"]["DRAFT_DESCRIPTION_ASPECT_TYPE"]
-                if draft_aspect_name not in aspects:
-                    aspects[draft_aspect_name] = struct_pb2.Struct()
-                
-                aspects[draft_aspect_name].update({"description": description})
-                
-                # Update the entry
-                update_mask = field_mask_pb2.FieldMask(paths=["aspects"])
-                request = dataplex_v1.UpdateEntryRequest(
-                    entry=entry,
-                    update_mask=update_mask
+                ok = self._client._dataplex_ops.update_table_draft_description(
+                    table_fqn, sanitized_desc
                 )
-                
-                updated_entry = client.update_entry(request=request)
-                return {"success": True, "message": f"Table {table_fqn} description updated"}
-                
-            elif item_type == "column":
-                # Format: column:project.dataset.table:column_name
-                table_fqn = parts[1]
-                column_name = parts[2]
-                
-                # Update the column draft description
-                client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
-                
-                # Get the entry
-                entry = self._client._dataplex_ops._get_entry(table_fqn)
-                if not entry:
-                    raise ValueError(f"Entry not found for table: {table_fqn}")
-                
-                # Update the draft description in the entry's aspects
-                aspects = entry.aspects
-                if not aspects:
-                    aspects = {}
-                
-                # Create or update the draft column descriptions aspect
-                draft_aspect_name = constants["DATAPLEX"]["DRAFT_COLUMN_DESCRIPTIONS_ASPECT_TYPE"]
-                if draft_aspect_name not in aspects:
-                    aspects[draft_aspect_name] = struct_pb2.Struct()
-                
-                # Get existing column descriptions
-                column_descriptions = {}
-                if aspects[draft_aspect_name].fields:
-                    column_descriptions = MessageToDict(aspects[draft_aspect_name])
-                
-                # Update the specific column description
-                column_descriptions[column_name] = description
-                
-                # Update the aspect
-                aspects[draft_aspect_name].update(column_descriptions)
-                
-                # Update the entry
-                update_mask = field_mask_pb2.FieldMask(paths=["aspects"])
-                request = dataplex_v1.UpdateEntryRequest(
-                    entry=entry,
-                    update_mask=update_mask
-                )
-                
-                updated_entry = client.update_entry(request=request)
-                return {"success": True, "message": f"Column {column_name} in table {table_fqn} description updated"}
-            else:
-                raise ValueError(f"Unknown item type: {item_type}")
-                
+                return {
+                    "success": bool(ok),
+                    "message": f"Table {table_fqn} description updated",
+                }
+            ok = self._client._dataplex_ops.update_column_draft_description(
+                table_fqn, column_name, sanitized_desc
+            )
+            return {
+                "success": bool(ok),
+                "message": f"Column {column_name} in table {table_fqn} description updated",
+            }
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Error editing review item: {str(e)}")
             logger.error(traceback.format_exc())
-            return {"success": False, "error": str(e)} 
+            return {"success": False, "error": "Failed to edit review item."} 

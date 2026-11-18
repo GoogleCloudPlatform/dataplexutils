@@ -32,27 +32,31 @@ class ClientOptions:
         use_data_quality=False,
         use_ext_documents=False,
         persist_to_dataplex_catalog=True,
-        stage_for_review=False,
+        stage_for_review=True,
         add_ai_warning=True,
         use_human_comments=False,
         regenerate=False,
         top_values_in_description=True,
         description_handling=constants["DESCRIPTION_HANDLING"]["APPEND"],
-        description_prefix=constants["OUTPUT_CLAUSES"]["AI_WARNING"]
+        description_prefix=constants["OUTPUT_CLAUSES"]["AI_WARNING"],
+        dry_run=False,
+        confirm_overwrite=False,
     ):
-        self._use_lineage_tables = use_lineage_tables
-        self._use_lineage_processes = use_lineage_processes
-        self._use_profile = use_profile
-        self._use_data_quality = use_data_quality
-        self._use_ext_documents = use_ext_documents
-        self._persist_to_dataplex_catalog = persist_to_dataplex_catalog
-        self._stage_for_review = stage_for_review
-        self._add_ai_warning = add_ai_warning
-        self._use_human_comments = use_human_comments
-        self._regenerate = regenerate
-        self._top_values_in_description = top_values_in_description
+        self._use_lineage_tables = bool(use_lineage_tables)
+        self._use_lineage_processes = bool(use_lineage_processes)
+        self._use_profile = bool(use_profile)
+        self._use_data_quality = bool(use_data_quality)
+        self._use_ext_documents = bool(use_ext_documents)
+        self._persist_to_dataplex_catalog = bool(persist_to_dataplex_catalog)
+        self._stage_for_review = bool(stage_for_review)
+        self._add_ai_warning = bool(add_ai_warning)
+        self._use_human_comments = bool(use_human_comments)
+        self._regenerate = bool(regenerate)
+        self._top_values_in_description = bool(top_values_in_description)
         self._description_handling = description_handling
         self._description_prefix = description_prefix
+        self._dry_run = bool(dry_run)
+        self._confirm_overwrite = bool(confirm_overwrite)
         
     def to_dict(self):
         """Convert the ClientOptions object to a dictionary."""
@@ -69,7 +73,9 @@ class ClientOptions:
             "regenerate": self._regenerate,
             "top_values_in_description": self._top_values_in_description,
             "description_handling": self._description_handling,
-            "description_prefix": self._description_prefix
+            "description_prefix": self._description_prefix,
+            "dry_run": self._dry_run,
+            "confirm_overwrite": self._confirm_overwrite,
         }
     
     def __str__(self):

@@ -14,7 +14,7 @@ Copyright 2025 Google LLC
    limitations under the License.
 */
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Box,
   Card,
@@ -24,34 +24,77 @@ import {
   Button,
   Alert,
   Grid,
+  FormControlLabel,
+  Switch,
+  InputAdornment,
+  IconButton,
 } from '@mui/material';
+import Visibility from '@mui/icons-material/Visibility';
+import VisibilityOff from '@mui/icons-material/VisibilityOff';
 import { DatplexConfig } from '../App';
+import { getStoredApiToken, saveApiToken } from '../utils/apiClient';
 
 interface ConfigurationPageProps {
   config: DatplexConfig;
   onConfigChange: (config: DatplexConfig) => void;
+  apiToken?: string;
+  onApiTokenChange?: (token: string) => void;
 }
 
-const ConfigurationPage: React.FC<ConfigurationPageProps> = ({ config, onConfigChange }) => {
+const ConfigurationPage: React.FC<ConfigurationPageProps> = ({
+  config,
+  onConfigChange,
+  apiToken,
+  onApiTokenChange,
+}) => {
   const [formData, setFormData] = useState<DatplexConfig>(config);
+  const [tokenInput, setTokenInput] = useState<string>(() =>
+    apiToken !== undefined ? apiToken : getStoredApiToken()
+  );
+  const [showToken, setShowToken] = useState<boolean>(false);
   const [saveStatus, setSaveStatus] = useState<'success' | 'error' | null>(null);
 
+  useEffect(() => {
+    setFormData(config);
+  }, [config]);
+
+  useEffect(() => {
+    if (apiToken !== undefined) {
+      setTokenInput(apiToken);
+    }
+  }, [apiToken]);
+
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const { name, value } = e.target;
+    const { name, value, type, checked } = e.target;
     setFormData(prev => ({
       ...prev,
-      [name]: value
+      [name]: type === 'checkbox' ? checked : value,
     }));
   };
 
   const handleSave = () => {
     try {
       onConfigChange(formData);
+      const normalizedToken = saveApiToken(tokenInput);
+      setTokenInput(normalizedToken);
+      if (onApiTokenChange) {
+        onApiTokenChange(normalizedToken);
+      }
       setSaveStatus('success');
       setTimeout(() => setSaveStatus(null), 3000);
     } catch (error) {
       setSaveStatus('error');
     }
+  };
+
+  const handleClearToken = () => {
+    setTokenInput('');
+    const cleared = saveApiToken('');
+    if (onApiTokenChange) {
+      onApiTokenChange(cleared);
+    }
+    setSaveStatus('success');
+    setTimeout(() => setSaveStatus(null), 3000);
   };
 
   return (
@@ -67,7 +110,7 @@ const ConfigurationPage: React.FC<ConfigurationPageProps> = ({ config, onConfigC
               <Typography variant="h6" gutterBottom>
                 Dataplex Settings
               </Typography>
-              
+
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                 <TextField
                   fullWidth
@@ -96,6 +139,28 @@ const ConfigurationPage: React.FC<ConfigurationPageProps> = ({ config, onConfigC
                   helperText="The location of your Dataplex instance"
                 />
 
+                <FormControlLabel
+                  control={
+                    <Switch
+                      name="stage_for_review"
+                      checked={Boolean(formData.stage_for_review)}
+                      onChange={handleInputChange}
+                    />
+                  }
+                  label="Stage for Review (recommended before writing to BigQuery)"
+                />
+
+                <FormControlLabel
+                  control={
+                    <Switch
+                      name="dry_run"
+                      checked={Boolean(formData.dry_run)}
+                      onChange={handleInputChange}
+                    />
+                  }
+                  label="Dry Run (preview proposed changes without writing metadata)"
+                />
+
                 <Button
                   variant="contained"
                   onClick={handleSave}
@@ -119,9 +184,72 @@ const ConfigurationPage: React.FC<ConfigurationPageProps> = ({ config, onConfigC
             </CardContent>
           </Card>
         </Grid>
+
+        <Grid item xs={12} md={6}>
+          <Card>
+            <CardContent>
+              <Typography variant="h6" gutterBottom>
+                API Authentication
+              </Typography>
+
+              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <TextField
+                  fullWidth
+                  label="API Token (X-API-Key)"
+                  name="api_token"
+                  type={showToken ? 'text' : 'password'}
+                  value={tokenInput}
+                  onChange={(e) => setTokenInput(e.target.value)}
+                  autoComplete="off"
+                  helperText="Stored only in sessionStorage for this browser session (never localStorage) and sent in the X-API-Key header."
+                  InputProps={{
+                    endAdornment: (
+                      <InputAdornment position="end">
+                        <IconButton
+                          aria-label={showToken ? 'Hide API token' : 'Show API token'}
+                          onClick={() => setShowToken(prev => !prev)}
+                          edge="end"
+                        >
+                          {showToken ? <VisibilityOff /> : <Visibility />}
+                        </IconButton>
+                      </InputAdornment>
+                    ),
+                  }}
+                />
+
+                <Box sx={{ display: 'flex', gap: 2 }}>
+                  <Button
+                    variant="contained"
+                    onClick={handleSave}
+                  >
+                    Save Token
+                  </Button>
+                  <Button
+                    variant="outlined"
+                    color="secondary"
+                    onClick={handleClearToken}
+                    disabled={!tokenInput}
+                  >
+                    Clear Token
+                  </Button>
+                </Box>
+
+                {tokenInput.trim() ? (
+                  <Alert severity="info">
+                    API token is configured for this browser session.
+                  </Alert>
+                ) : (
+                  <Alert severity="warning">
+                    No API token is configured. Authenticated backend endpoints require a valid X-API-Key token.
+                  </Alert>
+                )}
+              </Box>
+            </CardContent>
+          </Card>
+        </Grid>
       </Grid>
     </Box>
   );
 };
 
-export default ConfigurationPage; 
+export default ConfigurationPage;

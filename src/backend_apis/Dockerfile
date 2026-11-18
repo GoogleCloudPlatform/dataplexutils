@@ -3,7 +3,7 @@ FROM python:3.10
 WORKDIR /app
 
 COPY requirements.txt .
-COPY dataplexutils_metadata_wizard-0.0.1.tar.gz .
+COPY dataplexutils_metadata_wizard-0.0.2.tar.gz .
 
 RUN pip install --no-cache-dir -r requirements.txt
 

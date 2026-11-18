@@ -34,7 +34,8 @@ class PromptManager:
         self._prompt_type = prompt_type
         self._client_options = client_options
 
-    def get_promtp(self):
+    def get_prompt(self):
+        """Return the prompt template for the configured prompt type."""
         try:
             if self._prompt_type == PromtType.PROMPT_TYPE_TABLE:
                 return self._get_prompt_table()
@@ -46,15 +47,23 @@ class PromptManager:
             logger.error(f"Exception: {e}.")
             raise e
 
+    def get_promtp(self):
+        """Backward-compatible alias for get_prompt()."""
+        return self.get_prompt()
+
     def _get_prompt_table(self):
         try:
-            # System
-            table_description_prompt = constants["PROMPTS"]["SYSTEM_PROMPT"]
-            # Base
+            # Anti-injection preamble + Base
+            table_description_prompt = constants["PROMPTS"]["UNTRUSTED_DATA_PREAMBLE"]
             table_description_prompt = (
                 table_description_prompt
                 + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_BASE"]
             )
+            if constants["DATA"]["NUM_ROWS_TO_SAMPLE"] > 0:
+                table_description_prompt = (
+                    table_description_prompt
+                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_SAMPLE"]
+                )
             # Additional metadata information
             if self._client_options._use_profile:
                 table_description_prompt = (
@@ -106,7 +115,7 @@ class PromptManager:
                 table_description_prompt + constants["PROMPTS"]["OUTPUT_FORMAT_PROMPT"]
             )
 
-            logger.info(f"Table description prompt: {table_description_prompt}")
+            logger.debug("Built table description prompt template.")
             return table_description_prompt
         except Exception as e:
             logger.error(f"Exception: {e}.")
@@ -114,9 +123,8 @@ class PromptManager:
 
     def _get_prompt_columns(self):
         try:
-            # System
-            column_description_prompt = constants["PROMPTS"]["SYSTEM_PROMPT"]
-            # Base
+            # Anti-injection preamble + Base
+            column_description_prompt = constants["PROMPTS"]["UNTRUSTED_DATA_PREAMBLE"]
             if self._client_options._top_values_in_description == True:
                 column_description_prompt = (
                     column_description_prompt
@@ -127,7 +135,12 @@ class PromptManager:
                     column_description_prompt
                     + constants["PROMPTS"]["COLUMN_DESCRIPTION_PROMPT_BASE"]
                 )
-                
+
+            if constants["DATA"]["NUM_ROWS_TO_SAMPLE"] > 0:
+                column_description_prompt = (
+                    column_description_prompt
+                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_SAMPLE"]
+                )
             # Additional metadata information
             if self._client_options._use_profile:
                 column_description_prompt = (
@@ -149,6 +162,11 @@ class PromptManager:
                     column_description_prompt
                     + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_LINEAGE_PROCESSES"]
                 )
+            if self._client_options._use_ext_documents:
+                column_description_prompt = (
+                    column_description_prompt
+                    + constants["PROMPTS"]["TABLE_DESCRIPTION_PROMPT_DOCUMENT"]
+                )
             if self._client_options._use_human_comments:
                 column_description_prompt = (
                     column_description_prompt
@@ -158,7 +176,7 @@ class PromptManager:
             column_description_prompt = (
                 column_description_prompt + constants["PROMPTS"]["OUTPUT_FORMAT_PROMPT"]
             )
-            logger.info(f"Column description prompt: {column_description_prompt}")
+            logger.debug("Built column description prompt template.")
             return column_description_prompt
         except Exception as e:
             logger.error(f"Exception: {e}.")

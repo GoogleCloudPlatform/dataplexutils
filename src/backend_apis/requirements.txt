@@ -2,4 +2,6 @@ fastapi
 fastapi-cors
 db-dtypes
 uvicorn[standard]
+google-auth
+requests
 dataplexutils_metadata_wizard-0.0.2.tar.gz

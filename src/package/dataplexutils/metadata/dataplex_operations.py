@@ -36,11 +36,19 @@ from google.protobuf import field_mask_pb2, struct_pb2, json_format
 import google.api_core.exceptions
 from google.cloud import datacatalog_lineage_v1
 
+# Local imports
+from .utils import sanitize_llm_output, validate_gcs_uri
+
 # Load constants
 constants = toml.loads(pkgutil.get_data(__name__, "constants.toml").decode())
 # Logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(constants["LOGGING"]["WIZARD_LOGGER"])
+
+_MAX_DATA_SCANS = 5
+_MAX_SCAN_JOBS_CHECKED = 10
+_MAX_LINEAGE_SOURCES = 10
+_MAX_LINEAGE_PROCESSES = 10
 
 class DataplexOperations:
     """Dataplex-specific operations."""
@@ -146,7 +154,8 @@ class DataplexOperations:
                     if i.endswith(f"""global.overview""") and current_entry.aspects[i].path == "":
                         logger.info(f"Reading existing aspect {i} of table {table_fqn}")
                         old_overview = dict(current_entry.aspects[i].data)
-                        logger.info(f"""old_overview: {old_overview["content"][1:50]}...""")
+                        old_preview = (old_overview.get("content") or "")[:50]
+                        logger.info(f"old_overview: {old_preview}...")
             except Exception as e:
                 logger.error(f"Exception: {e}.")
                 raise e
@@ -157,19 +166,27 @@ class DataplexOperations:
             aspect_content = {}
 
             if old_overview is not None:
-                old_description = old_overview["content"]
-                logger.debug(f"""old_description: {old_description[0:50]}...""")
-                logger.debug(f"""new description: {description[0:50]}...""")
-                logger.debug(f"""description_handling: {self._client._client_options._description_handling}""")
+                old_description = old_overview.get("content", "") or ""
+                self._client._bigquery_ops._check_overwrite_allowed(
+                    old_description, "Dataplex overview"
+                )
+                sanitized_desc = sanitize_llm_output(
+                    description, max_chars=constants["DATA"]["MAX_TABLE_DESC_LENGTH"]
+                )
                 combined_description = self._client._utils.combine_description(
-                    old_description, 
-                    description, 
-                    self._client._client_options._description_handling
+                    old_description,
+                    sanitized_desc,
+                    self._client._client_options._description_handling,
+                    max_length=constants["DATA"]["MAX_TABLE_DESC_LENGTH"],
                 )
                 logger.debug(f"""FINAL combined_description: {combined_description}""")
                 aspect_content["content"] = combined_description
             else:
-                aspect_content = {"content": description}
+                aspect_content = {
+                    "content": sanitize_llm_output(
+                        description, max_chars=constants["DATA"]["MAX_TABLE_DESC_LENGTH"]
+                    )
+                }
 
             logger.info(f"""aspect_content: {aspect_content}...""")
             # Convert aspect_content to a Struct
@@ -219,23 +236,40 @@ class DataplexOperations:
         """
         try:
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
+            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
+            safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
+            sanitized_desc = sanitize_llm_output(
+                description, max_chars=constants["DATA"]["MAX_TABLE_DESC_LENGTH"]
+            )
             # Create new aspect content
             new_aspect_content = {
-                #"certified": "false",
-                #"user-who-certified": "",
-                "contents": description,
+                "contents": sanitized_desc,
                 "generation-date": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "to-be-regenerated": "false",
-                #"human-comments": [],
-                #"negative-examples": []
                 "is-accepted": "false"
             }
 
-            # If additional metadata was provided, update the aspect content
+            # If additional metadata was provided, validate and update the aspect content
+            safe_metadata = None
             if metadata:
-                new_aspect_content.update(metadata)
+                safe_metadata = dict(metadata)
+                if "external-document-uri" in safe_metadata:
+                    ext_uri = safe_metadata["external-document-uri"]
+                    if ext_uri is not None:
+                        if not isinstance(ext_uri, str):
+                            raise ValueError("Invalid external document URI.")
+                        ext_uri = ext_uri.strip()
+                        if ext_uri:
+                            validate_gcs_uri(ext_uri)
+                        safe_metadata["external-document-uri"] = ext_uri
+                if "contents" in safe_metadata and safe_metadata["contents"] is not None:
+                    safe_metadata["contents"] = sanitize_llm_output(
+                        safe_metadata["contents"],
+                        max_chars=constants["DATA"]["MAX_TABLE_DESC_LENGTH"],
+                    )
+                new_aspect_content.update(safe_metadata)
 
-            logger.info(f"aspect_content: {new_aspect_content}")
+            logger.info(f"Updating draft aspect for table {safe_fqn}")
             
             # Create the aspect
             new_aspect = dataplex_v1.Aspect()
@@ -243,10 +277,8 @@ class DataplexOperations:
             aspect_name = f"""{self._client._project_id}.global.{constants["ASPECT_TEMPLATE"]["name"]}"""
             aspect_types = [new_aspect.aspect_type]
 
-            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
-
             entry = dataplex_v1.Entry()
-            entry.name = f"projects/{project_id}/locations/{self._get_dataset_location(table_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+            entry.name = f"projects/{project_id}/locations/{self._get_dataset_location(safe_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
 
             # Check if the aspect already exists
             try:
@@ -264,13 +296,13 @@ class DataplexOperations:
                     logger.info(f"Updating aspect {i} with old_values")
                     new_aspect.data = entry.aspects[i].data
                     update_data = {
-                        "contents": description,
+                        "contents": sanitized_desc,
                         "generation-date": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "to-be-regenerated": "false",
                         "is-accepted": "false"
                     }
-                    if metadata:
-                        update_data.update(metadata)
+                    if safe_metadata:
+                        update_data.update(safe_metadata)
                     new_aspect.data.update(update_data)
                     logger.info(f"entry.aspects[aspect_name].data: {entry.aspects[i].data}")
                     logger.info(f"new_aspect.data: {new_aspect.data}")
@@ -348,12 +380,15 @@ class DataplexOperations:
             
 
             if overview:
-                # Update both BigQuery and Dataplex descriptions
-                logger.info(f"Updating Dataplex description: {overview}")
-                success_dataplex = self.update_table_dataplex_description(table_fqn, overview)
+                # Update BigQuery first so any overwrite guard failure avoids partial Dataplex mutation
                 logger.info(f"Updating BigQuery description: {overview}")
                 success_bigquery = self._client._bigquery_ops.update_table_description(table_fqn, overview)
-                
+                if not success_bigquery:
+                    logger.warning(f"BigQuery update returned False for table {table_fqn}; skipping Dataplex overview update")
+                    return False
+                logger.info(f"Updating Dataplex description: {overview}")
+                success_dataplex = self.update_table_dataplex_description(table_fqn, overview)
+
                 if success_dataplex and success_bigquery:
                     logger.info(f"Successfully updated description for table {table_fqn}")
                     return True
@@ -364,41 +399,32 @@ class DataplexOperations:
                 logger.warning(f"No draft description found for table {table_fqn}")
                 return False
                 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Exception in accept_table_draft_description: {e}")
             return False
 
     def update_column_draft_description(self, table_fqn, column_name, description):
-        """Updates the draft description for a column in Dataplex.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table
-            column_name (str): The name of the column
-            description (str): The new draft description
-
-        Returns:
-            bool: True if successful
-
-        Raises:
-            Exception: If there is an error updating the draft description
-        """
+        """Updates the draft description for a column in Dataplex."""
         try:
+            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
+            self._client._utils.validate_column_name(column_name)
+            safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
+            sanitized_desc = sanitize_llm_output(
+                description, max_chars=constants["DATA"]["MAX_COLUMN_DESC_LENGTH"]
+            )
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
 
             # Create new aspect content
             new_aspect_content = {
-                #"certified": "false",
-                #"user-who-certified": "",
-                "contents": description,
+                "contents": sanitized_desc,
                 "generation-date": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "to-be-regenerated": "false",
-                #"human-comments": [],
-                #"negative-examples": [],
-                #"external-document-uri": "",
                 "is-accepted": "false"
             }
 
-            logger.info(f"aspect_content: {new_aspect_content}")
+            logger.info(f"Updating draft aspect for column {safe_fqn}.{column_name}")
 
             # Create the aspect
             new_aspect = dataplex_v1.Aspect()
@@ -406,10 +432,8 @@ class DataplexOperations:
             aspect_name = f"""{self._client._project_id}.global.{constants["ASPECT_TEMPLATE"]["name"]}@Schema.{column_name}"""
             aspect_types = [new_aspect.aspect_type]
 
-            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
-
             entry = dataplex_v1.Entry()
-            entry.name = f"projects/{project_id}/locations/{self._get_dataset_location(table_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+            entry.name = f"projects/{project_id}/locations/{self._get_dataset_location(safe_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
 
             # Check if the aspect already exists
             try:
@@ -429,7 +453,7 @@ class DataplexOperations:
                     logger.info(f"Updating aspect {i} with new values")
                     new_aspect.data = entry.aspects[i].data
                     new_aspect.data.update({
-                        "contents": description,
+                        "contents": sanitized_desc,
                         "generation-date": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "to-be-regenerated": "false",
                         "is-accepted": "false"
@@ -491,20 +515,15 @@ class DataplexOperations:
 
             return False
 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Exception: {e}.")
             return False
 
     def check_if_column_should_be_regenerated(self, table_fqn, column_name):
-        """Checks if a column should be regenerated.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table
-            column_name (str): The name of the column
-
-        Returns:
-            bool: True if the column should be regenerated
-        """
+        """Checks if a column should be regenerated."""
+        self._client._utils.validate_column_name(column_name)
         try:
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
             project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
@@ -527,21 +546,15 @@ class DataplexOperations:
 
             return False
 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Exception: {e}.")
             return False
 
     def get_column_comment(self, table_fqn, column_name, comment_number=None):
-        """Gets comments for a column.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table
-            column_name (str): The name of the column
-            comment_number (int, optional): Specific comment number to retrieve
-
-        Returns:
-            list: List of comments or specific comment if comment_number provided
-        """
+        """Gets comments for a column."""
+        self._client._utils.validate_column_name(column_name)
         try:
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
             project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
@@ -623,31 +636,18 @@ class DataplexOperations:
             raise e
 
     def accept_column_draft_description(self, table_fqn, column_name):
-        """Accepts the draft description for a column by:
-           1. Reading the draft description from the custom review aspect.
-           2. Updating the custom review aspect to mark it as accepted.
-           3. Updating the actual column description in BigQuery.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table (project.dataset.table)
-            column_name (str): The name of the column to update
-
-        Returns:
-            bool: True if successful, False otherwise
-
-        Raises:
-            Exception: If there's an error accessing or updating the entry
-        """
+        """Accepts the draft description for a column."""
+        project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
+        self._client._utils.validate_column_name(column_name)
+        safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
         try:
-            logger.info(f"=== START: accept_column_draft_description for {table_fqn}.{column_name} ===")
+            logger.info(f"=== START: accept_column_draft_description for {safe_fqn}.{column_name} ===")
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
-            
+
             aspect_type_id = constants["ASPECT_TEMPLATE"]["name"]
             aspect_type = f"projects/{self._client._project_id}/locations/global/aspectTypes/{aspect_type_id}"
-            # Correct aspect name pattern for column aspects
             short_aspect_name_key = f"{aspect_type_id}@Schema.{column_name}"
-            project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
-            entry_name = f"projects/{project_id}/locations/{self._get_dataset_location(table_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
+            entry_name = f"projects/{project_id}/locations/{self._get_dataset_location(safe_fqn)}/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
 
             # 1. Get the current entry with the specific aspect type
             try:
@@ -731,15 +731,17 @@ class DataplexOperations:
             
   
             
-            logger.info(f"Successfully accepted and updated description for column {column_name} in table {table_fqn}")
+            logger.info(f"Successfully accepted and updated description for column {column_name} in table {safe_fqn}")
             return True
-                
+
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Unexpected exception in accept_column_draft_description: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
         finally:
-             logger.info(f"=== END: accept_column_draft_description for {table_fqn}.{column_name} ===")
+             logger.info(f"=== END: accept_column_draft_description for {safe_fqn}.{column_name} ===")
 
     def _construct_bq_resource_string(self, table_fqn):
         """Constructs a BigQuery resource string for use in API calls.
@@ -816,6 +818,8 @@ class DataplexOperations:
                 if hasattr(scan, 'data') and hasattr(scan.data, 'resource') and scan.data.resource == bq_resource_string:
                     logger.info(f"Found matching scan: {scan.name}")
                     scan_references.append(scan.name)
+                    if len(scan_references) >= _MAX_DATA_SCANS:
+                        break
             logger.info(f"Checked {count} scans. Found {len(scan_references)} matching references.")
             return scan_references
         except Exception as e:
@@ -899,8 +903,9 @@ class DataplexOperations:
                 data_profile_results = []
                 data_quality_results = []
                 table_scan_references = self._get_table_scan_reference(table_fqn)
-                for table_scan_reference in table_scan_references:
+                for table_scan_reference in table_scan_references[:_MAX_DATA_SCANS]:
                     if table_scan_reference:
+                        jobs_checked = 0
                         for job in scan_client.list_data_scan_jobs(
                             ListDataScanJobsRequest(
                                 parent=scan_client.get_data_scan(
@@ -908,6 +913,12 @@ class DataplexOperations:
                                 ).name
                             )
                         ):
+                            jobs_checked += 1
+                            if jobs_checked > _MAX_SCAN_JOBS_CHECKED:
+                                break
+                            job_state = getattr(job, "state", None)
+                            if job_state is not None and job_state != DataScanJob.State.SUCCEEDED:
+                                continue
                             job_result = scan_client.get_data_scan_job(
                                 request=GetDataScanJobRequest(
                                     name=job.name, view="FULL"
@@ -927,6 +938,7 @@ class DataplexOperations:
                                     data_profile_results.append(
                                         job_result_json["dataProfileResult"]
                                     )
+                                break
                 return {
                     "data_profile": data_profile_results,
                     "data_quality": data_quality_results,
@@ -957,8 +969,8 @@ class DataplexOperations:
         try:
             table_sources_info = []
             # Assumes a _get_table_sources method exists or is added, similar to the backup
-            table_sources = self._get_table_sources(table_fqn) 
-            for table_source in table_sources:
+            table_sources = self._get_table_sources(table_fqn)
+            for table_source in table_sources[:_MAX_LINEAGE_SOURCES]:
                 # Assumes these helper methods exist on the BigQueryOperations part of the client
                 source_schema, _ = self._client._bigquery_ops.get_table_schema(table_source) 
                 source_description = self._client._bigquery_ops.get_table_description(table_source)
@@ -1070,7 +1082,7 @@ class DataplexOperations:
                     )
                 )
                 
-                lineage_processes_ids = [process.process for process in process_links]
+                lineage_processes_ids = [process.process for process in process_links][:_MAX_LINEAGE_PROCESSES]
                 logger.info(f"Found {len(lineage_processes_ids)} associated processes.")
 
                 for process_id in lineage_processes_ids:
@@ -1271,18 +1283,8 @@ class DataplexOperations:
             return False
 
     def mark_column_for_regeneration(self, table_fqn: str, column_name: str) -> bool:
-        """Marks a column for regeneration by setting the to-be-regenerated flag in its metadata.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table (e.g., 'project.dataset.table')
-            column_name (str): The name of the column to mark for regeneration
-
-        Returns:
-            bool: True if the column was successfully marked for regeneration, False otherwise.
-
-        Raises:
-            Exception: If there is an error updating the column metadata in Dataplex
-        """
+        """Marks a column for regeneration by setting the to-be-regenerated flag in its metadata."""
+        self._client._utils.validate_column_name(column_name)
         try:
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
             project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)
@@ -1350,23 +1352,15 @@ class DataplexOperations:
             logger.info(f"Successfully marked column {column_name} in table {table_fqn} for regeneration")
             return True
 
+        except ValueError:
+            raise
         except Exception as e:
             logger.error(f"Failed to mark column {column_name} in table {table_fqn} for regeneration: {str(e)}")
             return False
 
     def mark_column_as_regenerated(self, table_fqn: str, column_name: str) -> bool:
-        """Marks a column as regenerated by setting the to-be-regenerated flag to false in its metadata.
-
-        Args:
-            table_fqn (str): The fully qualified name of the table (e.g., 'project.dataset.table')
-            column_name (str): The name of the column to mark as regenerated
-
-        Returns:
-            bool: True if the column was successfully marked as regenerated, False otherwise.
-
-        Raises:
-            Exception: If there is an error updating the column metadata in Dataplex
-        """
+        """Marks a column as regenerated by setting the to-be-regenerated flag to false in its metadata."""
+        self._client._utils.validate_column_name(column_name)
         try:
             client = self._client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
             project_id, dataset_id, table_id = self._client._utils.split_table_fqn(table_fqn)

@@ -14,42 +14,301 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from fastapi import FastAPI, Body, HTTPException, status, Request
+import datetime
+import logging
+import os
+import pkgutil
+import re
+import secrets
+import urllib.parse
+import uuid
+
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from google.api_core.exceptions import NotFound
+from google.auth.transport import requests as google_auth_requests
+from google.cloud import dataplex_v1
+from google.oauth2 import id_token as google_id_token
+from pydantic import BaseModel, ValidationError, field_validator
+import toml
+
 from dataplexutils.metadata.client import Client
 from dataplexutils.metadata.client_options import ClientOptions
+from dataplexutils.metadata.utils import (
+    get_max_tables_per_request,
+    sanitize_llm_output,
+    validate_column_name,
+    validate_dataset_id,
+    validate_location,
+    validate_project_id,
+    validate_table_id,
+)
 from dataplexutils.metadata.version import __version__
-from pydantic import BaseModel
-import logging
-import datetime
-import traceback
-from pydantic import ValidationError
-import json
-import uuid
-from google.cloud import dataplex_v1
-import toml
-import pkgutil
 
 # Load constants
 constants = toml.loads(pkgutil.get_data("dataplexutils.metadata", "constants.toml").decode())
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+_TABLE_FQN_RE = re.compile(
+    r"\A([A-Za-z0-9][A-Za-z0-9_-]{0,62})\.([A-Za-z0-9_]{1,1024})\.([A-Za-z0-9_-]{1,1024})\Z"
+)
+_SEARCH_TERM_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,128}\Z")
+_VALID_DESCRIPTION_HANDLINGS = {"append", "prepend", "replace"}
+_MAX_DESCRIPTION_LENGTH = constants["DATA"]["MAX_TABLE_DESC_LENGTH"]
+_MAX_COMMENT_LENGTH = 2048
+
+
+def _is_env_true(env_name: str, default: str = "false") -> bool:
+    return os.environ.get(env_name, default).strip().lower() in {"true", "1", "yes"}
+
+
+def _get_cors_origins() -> list[str]:
+    """Build an explicit CORS origin allowlist from METADATA_WIZARD_CORS_ORIGINS."""
+    raw = os.environ.get("METADATA_WIZARD_CORS_ORIGINS", "").strip()
+    if not raw:
+        return ["http://localhost:3000"]
+
+    origins: list[str] = []
+    for entry in raw.split(","):
+        origin = entry.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            logger.warning("Ignoring wildcard '*' in METADATA_WIZARD_CORS_ORIGINS")
+            continue
+        parsed = urllib.parse.urlparse(origin)
+        if parsed.scheme in {"http", "https"} and parsed.netloc and not parsed.path:
+            origins.append(origin)
+        else:
+            logger.warning("Ignoring invalid CORS origin entry")
+
+    return origins or ["http://localhost:3000"]
+
+
+def get_allowed_projects() -> set[str] | None:
+    """Return allowed GCP project IDs, or None only if explicitly opted in."""
+    if _is_env_true("METADATA_WIZARD_ALLOW_ANY_PROJECT", "false"):
+        return None
+
+    for env_name in (
+        "METADATA_WIZARD_ALLOWED_PROJECTS",
+        "METADATA_WIZARD_ALLOWED_PROJECT",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCP_PROJECT",
+    ):
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            projects = {p.strip() for p in raw.split(",") if p.strip()}
+            if projects:
+                return projects
+    return set()
+
+
+def enforce_allowed_projects(*project_ids: str | None) -> None:
+    """Enforce that all supplied GCP project IDs are explicitly allowlisted."""
+    allowed = get_allowed_projects()
+    if allowed is None:
+        return
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Project allowlist is not configured; access denied",
+        )
+    for pid in project_ids:
+        if pid and pid not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Target project is not permitted by this deployment",
+            )
+
+
+def _constant_time_equals(a: str, b: str) -> bool:
+    """Compare strings in constant time using UTF-8 bytes to avoid ASCII-only TypeError."""
+    return secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def verify_auth(request: Request) -> str:
+    """Fail-closed authentication supporting X-API-Key, Bearer token, and Google OIDC."""
+    expected_token = os.environ.get("METADATA_WIZARD_API_TOKEN", "").strip()
+    oidc_audience = os.environ.get("METADATA_WIZARD_OIDC_AUDIENCE", "").strip()
+    allowed_emails = {
+        email.strip().lower()
+        for email in os.environ.get("METADATA_WIZARD_OIDC_ALLOWED_EMAILS", "").split(",")
+        if email.strip()
+    }
+
+    if not expected_token and not oidc_audience:
+        logger.error(
+            "Authentication is not configured (set METADATA_WIZARD_API_TOKEN or METADATA_WIZARD_OIDC_AUDIENCE)"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server authentication is not configured",
+        )
+
+    api_key = request.headers.get("X-API-Key", "").strip()
+    if api_key:
+        if expected_token and _constant_time_equals(api_key, expected_token):
+            return "api_key"
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    auth_header = request.headers.get("Authorization", "")
+    scheme, _, bearer_token = auth_header.partition(" ")
+    bearer_token = bearer_token.strip() if scheme.lower() == "bearer" else ""
+
+    if bearer_token:
+        if expected_token and _constant_time_equals(bearer_token, expected_token):
+            return "bearer_token"
+
+        if oidc_audience:
+            try:
+                claims = google_id_token.verify_oauth2_token(
+                    bearer_token,
+                    google_auth_requests.Request(),
+                    audience=oidc_audience,
+                )
+                issuer = claims.get("iss")
+                if issuer not in {"accounts.google.com", "https://accounts.google.com"}:
+                    raise ValueError("Invalid OIDC token issuer")
+                if allowed_emails:
+                    email = str(claims.get("email", "")).lower()
+                    if claims.get("email_verified") is not True or email not in allowed_emails:
+                        raise ValueError("OIDC principal is not authorized")
+                return str(claims.get("email") or claims.get("sub") or "oidc_user")
+            except Exception:
+                logger.warning("OIDC bearer token verification failed")
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Missing or invalid authentication credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _validate_table_fqn(table_fqn: str) -> tuple[str, str, str]:
+    if not isinstance(table_fqn, str):
+        raise ValueError("Invalid table FQN.")
+    match = _TABLE_FQN_RE.match(table_fqn.strip())
+    if not match:
+        raise ValueError("Invalid table FQN.")
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _parse_review_item_id(item_id: str) -> tuple[str, str, str | None]:
+    if not isinstance(item_id, str) or not item_id.strip():
+        raise ValueError("Invalid review item ID format.")
+    cleaned = item_id.strip()
+
+    item_type = None
+    table_fqn = None
+    column_name = None
+
+    if "#" in cleaned:
+        parts = cleaned.split("#")
+        if len(parts) == 2 and parts[1] == "table":
+            item_type = "table"
+            table_fqn = parts[0]
+        elif len(parts) == 3 and parts[1] == "column":
+            item_type = "column"
+            table_fqn = parts[0]
+            column_name = parts[2]
+        elif len(parts) == 2 and parts[1].startswith("column."):
+            item_type = "column"
+            table_fqn = parts[0]
+            column_name = parts[1][len("column."):]
+    elif ":" in cleaned:
+        parts = cleaned.split(":")
+        if len(parts) == 2 and parts[0] == "table":
+            item_type = "table"
+            table_fqn = parts[1]
+        elif len(parts) == 3 and parts[0] == "column":
+            item_type = "column"
+            table_fqn = parts[1]
+            column_name = parts[2]
+
+    if item_type not in {"table", "column"} or not table_fqn:
+        raise ValueError("Invalid review item ID format.")
+
+    project_id, dataset_id, table_id = _validate_table_fqn(table_fqn)
+    safe_fqn = f"{project_id}.{dataset_id}.{table_id}"
+    if item_type == "column":
+        validate_column_name(column_name or "")
+    return item_type, safe_fqn, column_name
+
+
+def _safe_value_error_message(exc: ValueError) -> str:
+    msg = str(exc).strip()
+    if (
+        not msg
+        or len(msg) > 220
+        or any(token in msg for token in ("gs://", "http://", "https://", "\n", "\r", "Traceback"))
+    ):
+        return "Invalid request parameters"
+    return msg
+
+
+def _handle_api_exception(exc: Exception, context: str) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, PermissionError):
+        logger.warning("%s: permission denied", context)
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied",
+        )
+    if isinstance(exc, ValueError):
+        logger.warning("%s: validation error: %s", context, exc)
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_safe_value_error_message(exc),
+        )
+    if isinstance(exc, NotFound):
+        logger.warning("%s: resource not found", context)
+        return HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Requested resource was not found",
+        )
+    if isinstance(exc, ValidationError):
+        logger.warning("%s: payload validation error", context)
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid request parameters",
+        )
+    ref = str(uuid.uuid4())
+    logger.exception("%s [ref=%s]", context, ref)
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=f"Internal server error (ref: {ref})",
+    )
+
 
 class ClientOptionsSettings(BaseModel):
-    use_lineage_tables: bool
-    use_lineage_processes: bool
-    use_profile: bool
-    use_data_quality: bool
-    use_ext_documents: bool
-    persist_to_dataplex_catalog: bool
-    stage_for_review: bool
-    top_values_in_description: bool
-    description_handling: str
-    description_prefix: str
+    use_lineage_tables: bool = False
+    use_lineage_processes: bool = False
+    use_profile: bool = False
+    use_data_quality: bool = False
+    use_ext_documents: bool = False
+    persist_to_dataplex_catalog: bool = True
+    stage_for_review: bool = True
+    top_values_in_description: bool = True
+    description_handling: str = "append"
+    description_prefix: str = constants["OUTPUT_CLAUSES"]["AI_WARNING"]
+    dry_run: bool = False
+    confirm_overwrite: bool = False
+
+    @field_validator("description_handling")
+    @classmethod
+    def _validate_description_handling(cls, v: str) -> str:
+        if not isinstance(v, str) or v.strip().lower() not in _VALID_DESCRIPTION_HANDLINGS:
+            raise ValueError("description_handling must be one of: append, prepend, replace")
+        return v.strip().lower()
 
 
 class ClientSettings(BaseModel):
@@ -57,38 +316,156 @@ class ClientSettings(BaseModel):
     llm_location: str
     dataplex_location: str
 
+    @field_validator("project_id")
+    @classmethod
+    def _check_project_id(cls, v: str) -> str:
+        return validate_project_id(v)
+
+    @field_validator("llm_location", "dataplex_location")
+    @classmethod
+    def _check_location(cls, v: str) -> str:
+        return validate_location(v)
+
 
 class TableSettings(BaseModel):
     project_id: str
-    dataset_id: str
-    table_id: str
+    dataset_id: str | None = None
+    table_id: str | None = None
     documentation_uri: str | None = None
+
+    @field_validator("project_id")
+    @classmethod
+    def _check_project_id(cls, v: str) -> str:
+        return validate_project_id(v)
+
+    @field_validator("dataset_id")
+    @classmethod
+    def _check_dataset_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        return validate_dataset_id(cleaned)
+
+    @field_validator("table_id")
+    @classmethod
+    def _check_table_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        return validate_table_id(cleaned)
+
+    @field_validator("documentation_uri")
+    @classmethod
+    def _normalize_doc_uri(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        return cleaned or None
+
 
 class DatasetSettings(BaseModel):
     project_id: str
     dataset_id: str | None = None
-    documentation_csv_uri: str
-    strategy: str
+    documentation_csv_uri: str | None = None
+    strategy: str = "NAIVE"
+
+    @field_validator("project_id")
+    @classmethod
+    def _check_project_id(cls, v: str) -> str:
+        return validate_project_id(v)
+
+    @field_validator("dataset_id")
+    @classmethod
+    def _check_dataset_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        return validate_dataset_id(cleaned)
+
+    @field_validator("documentation_csv_uri")
+    @classmethod
+    def _normalize_csv_uri(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        return cleaned or None
+
 
 class ColumnSettings(BaseModel):
     column_name: str
+
+    @field_validator("column_name")
+    @classmethod
+    def _check_column_name(cls, v: str) -> str:
+        return validate_column_name(v)
+
 
 class RegenerationCounts(BaseModel):
     tables: int
     columns: int
 
+
 class RegenerationRequest(BaseModel):
-    objects: list[str]
+    objects: list[str] = []
+
+    @field_validator("objects")
+    @classmethod
+    def _check_objects(cls, values: list[str]) -> list[str]:
+        cleaned_list: list[str] = []
+        for item in values:
+            if not isinstance(item, str):
+                raise ValueError("Invalid regeneration filter.")
+            cleaned = item.strip()
+            if not cleaned:
+                continue
+            if cleaned.upper() in {"AND", "OR", "NOT"} or not _SEARCH_TERM_RE.match(cleaned):
+                raise ValueError("Invalid regeneration filter.")
+            cleaned_list.append(cleaned)
+        return cleaned_list
+
 
 class MarkForRegenerationRequest(BaseModel):
     table_fqn: str
     column_name: str | None = None
 
+    @field_validator("table_fqn")
+    @classmethod
+    def _check_table_fqn(cls, v: str) -> str:
+        project_id, dataset_id, table_id = _validate_table_fqn(v)
+        return f"{project_id}.{dataset_id}.{table_id}"
+
+    @field_validator("column_name")
+    @classmethod
+    def _check_column_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        return validate_column_name(cleaned)
+
+
 class UpdateDraftDescriptionRequest(BaseModel):
     client_settings: ClientSettings
     table_settings: TableSettings
     description: str
-    is_html: bool
+    is_html: bool = False
+
+    @field_validator("description")
+    @classmethod
+    def _check_description(cls, v: str) -> str:
+        if not isinstance(v, str):
+            raise ValueError("Description must be a string.")
+        if len(v) > _MAX_DESCRIPTION_LENGTH:
+            raise ValueError("Description exceeds maximum allowed length.")
+        return v
+
 
 class AddCommentRequest(BaseModel):
     client_settings: ClientSettings
@@ -96,18 +473,148 @@ class AddCommentRequest(BaseModel):
     comment: str
     column_name: str | None = None
 
+    @field_validator("comment")
+    @classmethod
+    def _check_comment(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("Comment must be a non-empty string.")
+        if len(v) > _MAX_COMMENT_LENGTH:
+            raise ValueError("Comment exceeds maximum allowed length.")
+        cleaned = sanitize_llm_output(v.strip(), max_chars=_MAX_COMMENT_LENGTH)
+        if not cleaned:
+            raise ValueError("Comment must be a non-empty string.")
+        return cleaned
+
+    @field_validator("column_name")
+    @classmethod
+    def _check_column_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            return None
+        return validate_column_name(cleaned)
+
+
 class AddNegativeExampleRequest(BaseModel):
     client_settings: ClientSettings
     table_settings: TableSettings
     example: str
 
+    @field_validator("example")
+    @classmethod
+    def _check_example(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("Negative example must be a non-empty string.")
+        if len(v) > _MAX_COMMENT_LENGTH:
+            raise ValueError("Negative example exceeds maximum allowed length.")
+        cleaned = sanitize_llm_output(v.strip(), max_chars=_MAX_COMMENT_LENGTH)
+        if not cleaned:
+            raise ValueError("Negative example must be a non-empty string.")
+        return cleaned
+
+
+def _enforce_replace_policy(client_options_settings: ClientOptionsSettings) -> None:
+    allow_replace = _is_env_true("METADATA_WIZARD_ALLOW_REPLACE", "false")
+    if (
+        not allow_replace
+        and client_options_settings.description_handling.strip().lower() == "replace"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Destructive 'replace' description handling is disabled by server policy",
+        )
+
+
+def _enforce_generation_policy(client_options_settings: ClientOptionsSettings) -> None:
+    allow_direct = _is_env_true("METADATA_WIZARD_ALLOW_DIRECT_BQ_WRITE", "false")
+
+    if (
+        not allow_direct
+        and not client_options_settings.dry_run
+        and not client_options_settings.stage_for_review
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Direct BigQuery writes are disabled; enable stage_for_review or dry_run",
+        )
+    _enforce_replace_policy(client_options_settings)
+
+
+def _build_client_options(settings: ClientOptionsSettings) -> ClientOptions:
+    return ClientOptions(
+        use_lineage_tables=settings.use_lineage_tables,
+        use_lineage_processes=settings.use_lineage_processes,
+        use_profile=settings.use_profile,
+        use_data_quality=settings.use_data_quality,
+        use_ext_documents=settings.use_ext_documents,
+        persist_to_dataplex_catalog=settings.persist_to_dataplex_catalog,
+        stage_for_review=settings.stage_for_review,
+        top_values_in_description=settings.top_values_in_description,
+        description_handling=settings.description_handling,
+        description_prefix=settings.description_prefix,
+        dry_run=settings.dry_run,
+        confirm_overwrite=settings.confirm_overwrite,
+    )
+
+
+def _build_client(
+    client_settings: ClientSettings, client_options: ClientOptions | None = None
+) -> Client:
+    llm_project_id = os.environ.get("METADATA_WIZARD_LLM_PROJECT_ID", "").strip() or None
+    if llm_project_id:
+        validate_project_id(llm_project_id)
+    return Client(
+        project_id=client_settings.project_id,
+        llm_location=client_settings.llm_location,
+        dataplex_location=client_settings.dataplex_location,
+        client_options=client_options,
+        llm_project_id=llm_project_id,
+    )
+
+
+def _require_table_fqn(table_settings: TableSettings) -> str:
+    if not table_settings.dataset_id or not table_settings.table_id:
+        raise ValueError("dataset_id and table_id are required.")
+    return f"{table_settings.project_id}.{table_settings.dataset_id}.{table_settings.table_id}"
+
+
+def _require_dataset_fqn(dataset_settings: DatasetSettings) -> str:
+    if not dataset_settings.dataset_id:
+        raise ValueError("dataset_id is required.")
+    return f"{dataset_settings.project_id}.{dataset_settings.dataset_id}"
+
+
+app = FastAPI(
+    dependencies=[Depends(verify_auth)],
+    openapi_url=None,
+    docs_url=None,
+    redoc_url=None,
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for debugging
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_get_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning("HTTP %s on %s: %s", exc.status_code, request.url.path, exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info("Request: %s %s", request.method, request.url.path)
+    return await call_next(request)
 
 
 @app.get("/version")
@@ -120,421 +627,266 @@ def generate_table_description(
     client_options_settings: ClientOptionsSettings = Body(),
     client_settings: ClientSettings = Body(),
     table_settings: TableSettings = Body(),
-    dataset_settings: DatasetSettings = Body(),
+    dataset_settings: DatasetSettings | None = Body(default=None),
 ):
- 
-    """
-        Generates a table description in Dataplex using the provided settings.
-
-        Args:
-            client_options_settings: Configuration for the Dataplex client options.
-            client_settings: Project and location details.
-            table_settings: Table identifier information.
-
-        Returns:
-            The result of the table description generation process, or an error
-            message if something goes wrong.
-
-    """
+    """Generates a table description using the provided settings."""
     try:
-        print("Client options class definition: ",ClientOptions.__dict__)
-        client_options = ClientOptions(
-            use_lineage_tables=client_options_settings.use_lineage_tables,
-            use_lineage_processes=client_options_settings.use_lineage_processes,
-            use_profile=client_options_settings.use_profile,
-            use_data_quality=client_options_settings.use_data_quality,
-            use_ext_documents=client_options_settings.use_ext_documents,
-            persist_to_dataplex_catalog=client_options_settings.persist_to_dataplex_catalog,
-            stage_for_review=client_options_settings.stage_for_review,
-            top_values_in_description=client_options_settings.top_values_in_description,
-            description_handling=client_options_settings.description_handling,
-            description_prefix=client_options_settings.description_prefix
+        enforce_allowed_projects(
+            client_settings.project_id,
+            table_settings.project_id,
+            dataset_settings.project_id if dataset_settings else None,
         )
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-            client_options=client_options
-        )
-        table_fqn = f"{table_settings.project_id}.{table_settings.dataset_id}.{table_settings.table_id}"
-        logger.info(f"Received arguments: {client_options_settings}, {client_settings}, {table_settings}")
-        logger.info(f"Generating for table: {table_fqn}")
-        client.generate_table_description(table_fqn,table_settings.documentation_uri)
-        return {
-            "message": "Table description generated successfully"
-           
-        }
+        _enforce_generation_policy(client_options_settings)
+        table_fqn = _require_table_fqn(table_settings)
+
+        client_options = _build_client_options(client_options_settings)
+        client = _build_client(client_settings, client_options)
+
+        logger.info("Generating table description for %s", table_fqn)
+        result = client.generate_table_description(table_fqn, table_settings.documentation_uri)
+        if client_options_settings.dry_run:
+            return {
+                "message": "Dry-run preview generated successfully",
+                "dry_run": True,
+                "preview": result,
+            }
+        return {"message": "Table description generated successfully"}
     except Exception as e:
-        logger.exception("An error occurred while generating table descriptions") 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        raise _handle_api_exception(e, "generate_table_description")
+
 
 @app.post("/generate_columns_descriptions")
 def generate_columns_descriptions(
     client_options_settings: ClientOptionsSettings = Body(),
     client_settings: ClientSettings = Body(),
     table_settings: TableSettings = Body(),
-    dataset_settings: DatasetSettings = Body(),
+    dataset_settings: DatasetSettings | None = Body(default=None),
 ):
+    """Generates column descriptions for a table using the provided settings."""
     try:
-        client_options = ClientOptions(
-            use_lineage_tables=client_options_settings.use_lineage_tables,
-            use_lineage_processes=client_options_settings.use_lineage_processes,
-            use_profile=client_options_settings.use_profile,
-            use_data_quality=client_options_settings.use_data_quality,
-            use_ext_documents=client_options_settings.use_ext_documents,
-            persist_to_dataplex_catalog=client_options_settings.persist_to_dataplex_catalog,
-            stage_for_review=client_options_settings.stage_for_review,
-            top_values_in_description=client_options_settings.top_values_in_description,
-            description_handling=client_options_settings.description_handling,
-            description_prefix=client_options_settings.description_prefix
+        enforce_allowed_projects(
+            client_settings.project_id,
+            table_settings.project_id,
+            dataset_settings.project_id if dataset_settings else None,
         )
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-            client_options=client_options
-        )
+        _enforce_generation_policy(client_options_settings)
+        table_fqn = _require_table_fqn(table_settings)
 
-        table_fqn = f"{table_settings.project_id}.{table_settings.dataset_id}.{table_settings.table_id}"
-        client.generate_columns_descriptions(table_fqn, table_settings.documentation_uri)
+        client_options = _build_client_options(client_options_settings)
+        client = _build_client(client_settings, client_options)
+
+        logger.info("Generating column descriptions for %s", table_fqn)
+        result = client.generate_columns_descriptions(table_fqn, table_settings.documentation_uri)
+        if client_options_settings.dry_run:
+            return {
+                "message": "Dry-run column preview generated successfully",
+                "dry_run": True,
+                "preview": result,
+            }
         return {"message": "Column descriptions generated successfully"}
     except Exception as e:
-        logger.exception("An error occurred while generating column descriptions") 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        raise _handle_api_exception(e, "generate_columns_descriptions")
+
 
 @app.post("/generate_dataset_tables_descriptions")
 def generate_dataset_tables_descriptions(
     client_options_settings: ClientOptionsSettings = Body(),
     client_settings: ClientSettings = Body(),
-    table_settings: TableSettings = Body(),
+    table_settings: TableSettings | None = Body(default=None),
     dataset_settings: DatasetSettings = Body(),
 ):
-    """
-        Generates a table description in Dataplex using the provided settings.
-
-        Args:
-            client_options_settings: Configuration for the Dataplex client options.
-            client_settings: Project and location details.
-            dataset_settings: Dataset identifier information.
-        
-        Returns:
-            The result of the multiple table description generation process, or an error
-            message if something goes wrong.
-    
-    """
+    """Generates table descriptions for a dataset using the provided settings."""
     try:
-        logger.debug("Generating dataset tables request")
-        client_options = ClientOptions(
-            use_lineage_tables=client_options_settings.use_lineage_tables,
-            use_lineage_processes=client_options_settings.use_lineage_processes,
-            use_profile=client_options_settings.use_profile,
-            use_data_quality=client_options_settings.use_data_quality,
-            use_ext_documents=client_options_settings.use_ext_documents,
-            persist_to_dataplex_catalog=client_options_settings.persist_to_dataplex_catalog,
-            stage_for_review=client_options_settings.stage_for_review,
-            top_values_in_description=client_options_settings.top_values_in_description,
-            description_handling=client_options_settings.description_handling,
-            description_prefix=client_options_settings.description_prefix
+        enforce_allowed_projects(
+            client_settings.project_id,
+            dataset_settings.project_id,
+            table_settings.project_id if table_settings else None,
         )
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,        
-            client_options=client_options,
-            
-        )
+        _enforce_generation_policy(client_options_settings)
+        dataset_fqn = _require_dataset_fqn(dataset_settings)
 
-        dataset_fqn = f"{dataset_settings.project_id}.{dataset_settings.dataset_id}"
-        logger.info(f"Received arguments: {client_options_settings}, {client_settings}, {dataset_settings}")
-        logger.info(f"Generating for dataset: {dataset_fqn}")
-        client.generate_dataset_tables_descriptions(dataset_fqn,dataset_settings.strategy,dataset_settings.documentation_csv_uri)
+        client_options = _build_client_options(client_options_settings)
+        client = _build_client(client_settings, client_options)
+
+        logger.info("Generating dataset table descriptions for %s", dataset_fqn)
+        result = client.generate_dataset_tables_descriptions(
+            dataset_fqn, dataset_settings.strategy, dataset_settings.documentation_csv_uri
+        )
+        if client_options_settings.dry_run:
+            return {
+                "message": "Dry-run dataset table preview generated successfully",
+                "dry_run": True,
+                "preview": result,
+            }
         return {"message": "Dataset table descriptions generated successfully"}
     except Exception as e:
-        logger.exception("An error occurred while generating dataset descriptions") 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        raise _handle_api_exception(e, "generate_dataset_tables_descriptions")
+
 
 @app.post("/generate_dataset_tables_columns_descriptions")
 def generate_dataset_tables_columns_descriptions(
     client_options_settings: ClientOptionsSettings = Body(),
     client_settings: ClientSettings = Body(),
-    table_settings: TableSettings = Body(),
+    table_settings: TableSettings | None = Body(default=None),
     dataset_settings: DatasetSettings = Body(),
 ):
-    """
-        Generates a table description in Dataplex using the provided settings.
-
-        Args:
-            client_options_settings: Configuration for the Dataplex client options.
-            client_settings: Project and location details.
-            dataset_settings: Dataset identifier information.
-        
-        Returns:
-            The result of the multiple table description generation process, or an error
-            message if something goes wrong.
-    
-    """
+    """Generates table and column descriptions for a dataset."""
     try:
-        logger.debug("Generating dataset tables request")
-        client_options = ClientOptions(
-            use_lineage_tables=client_options_settings.use_lineage_tables,
-            use_lineage_processes=client_options_settings.use_lineage_processes,
-            use_profile=client_options_settings.use_profile,
-            use_data_quality=client_options_settings.use_data_quality,
-            use_ext_documents=client_options_settings.use_ext_documents,
-            persist_to_dataplex_catalog=client_options_settings.persist_to_dataplex_catalog,
-            stage_for_review=client_options_settings.stage_for_review,
-            top_values_in_description=client_options_settings.top_values_in_description,
-            description_handling=client_options_settings.description_handling,
-            description_prefix=client_options_settings.description_prefix
+        enforce_allowed_projects(
+            client_settings.project_id,
+            dataset_settings.project_id,
+            table_settings.project_id if table_settings else None,
         )
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,        
-            client_options=client_options,            
-        )
+        _enforce_generation_policy(client_options_settings)
+        dataset_fqn = _require_dataset_fqn(dataset_settings)
 
-        dataset_fqn = f"{dataset_settings.project_id}.{dataset_settings.dataset_id}"
-        logger.info(f"Received arguments: {client_options_settings}, {client_settings}, {dataset_settings}")
-        logger.info(f"Generating for dataset: {dataset_fqn}")
-        client.generate_dataset_tables_columns_descriptions(dataset_fqn,dataset_settings.strategy,dataset_settings.documentation_csv_uri)
+        client_options = _build_client_options(client_options_settings)
+        client = _build_client(client_settings, client_options)
+
+        logger.info("Generating dataset table and column descriptions for %s", dataset_fqn)
+        result = client.generate_dataset_tables_columns_descriptions(
+            dataset_fqn, dataset_settings.strategy, dataset_settings.documentation_csv_uri
+        )
+        if client_options_settings.dry_run:
+            return {
+                "message": "Dry-run dataset tables and columns preview generated successfully",
+                "dry_run": True,
+                "preview": result,
+            }
         return {"message": "Dataset table columns descriptions generated successfully"}
     except Exception as e:
-        logger.exception("An error occurred while generating dataset descriptions") 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        raise _handle_api_exception(e, "generate_dataset_tables_columns_descriptions")
+
 
 @app.post("/accept_table_draft_description")
 def accept_table_draft_description(
+    principal: str = Depends(verify_auth),
     client_options_settings: ClientOptionsSettings = Body(),
     client_settings: ClientSettings = Body(),
     table_settings: TableSettings = Body(),
-    dataset_settings: DatasetSettings = Body(),
+    dataset_settings: DatasetSettings | None = Body(default=None),
 ):
-    """
-    Accepts the draft description for a table, promoting it to the actual table description.
-
-    Args:
-        client_options_settings: Configuration for the Dataplex client options.
-        client_settings: Project and location details.
-        table_settings: Table identifier information.
-
-    Returns:
-        A message indicating success or failure.
-    """
+    """Accepts the draft description for a table, promoting it to the actual description."""
     try:
-        logger.info("=== START: accept_table_draft_description ===")
-        client_options = ClientOptions(
-            use_lineage_tables=client_options_settings.use_lineage_tables,
-            use_lineage_processes=client_options_settings.use_lineage_processes,
-            use_profile=client_options_settings.use_profile,
-            use_data_quality=client_options_settings.use_data_quality,
-            use_ext_documents=client_options_settings.use_ext_documents,
-            persist_to_dataplex_catalog=client_options_settings.persist_to_dataplex_catalog,
-            stage_for_review=client_options_settings.stage_for_review,
-            description_handling=client_options_settings.description_handling,
-            description_prefix=client_options_settings.description_prefix
+        enforce_allowed_projects(
+            client_settings.project_id,
+            table_settings.project_id,
+            dataset_settings.project_id if dataset_settings else None,
         )
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-            client_options=client_options
-        )
+        _enforce_replace_policy(client_options_settings)
+        table_fqn = _require_table_fqn(table_settings)
 
-        table_fqn = f"{table_settings.project_id}.{table_settings.dataset_id}.{table_settings.table_id}"
-        logger.info(f"Accepting draft description for table: {table_fqn}")
-        
-        # Get existing comments and negative examples
+        client_options = _build_client_options(client_options_settings)
+        client = _build_client(client_settings, client_options)
+
+        logger.info("Accepting draft description for table %s", table_fqn)
         existing_comments = client.get_comments_to_table_draft_description(table_fqn) or []
-        existing_negative_examples = client.get_negative_examples_to_table_draft_description(table_fqn) or []
-        
-        # First, update the aspect metadata to mark it as accepted
-        # Only use fields that are defined in the aspect template
+        existing_negative_examples = (
+            client.get_negative_examples_to_table_draft_description(table_fqn) or []
+        )
+        details = client.get_review_item_details(table_fqn)
+        draft_description = (details or {}).get("draftDescription", "")
+        if not draft_description:
+            raise ValueError("No draft description found for table.")
+
+        # Promote to BigQuery & Dataplex overview BEFORE marking draft as accepted
+        accepted = client.accept_table_draft_description(table_fqn)
+        if not accepted:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to accept table draft description",
+            )
+
+        now_iso = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
         aspect_content = {
             "certified": "true",
-            "user-who-certified": "system",  # You might want to pass the actual user from the frontend
-            "contents": client._review_ops.get_review_item_details(table_fqn)["draftDescription"],
-            "generation-date": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "user-who-certified": principal or "system",
+            "contents": draft_description,
+            "generation-date": now_iso,
             "to-be-regenerated": "false",
-            "human-comments": existing_comments,  # Preserve existing comments
-            "negative-examples": existing_negative_examples,  # Preserve existing negative examples
-            "external-document-uri": table_settings.documentation_uri if hasattr(table_settings, 'documentation_uri') else "",
+            "human-comments": existing_comments,
+            "negative-examples": existing_negative_examples,
+            "external-document-uri": table_settings.documentation_uri or "",
             "is-accepted": True,
-            "when-accepted": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            "when-accepted": now_iso,
         }
-        
-        # Update the aspect with the new metadata
+
         success = client._dataplex_ops.update_table_draft_description(
             table_fqn=table_fqn,
-            description=aspect_content["contents"],
-            metadata=aspect_content
+            description=draft_description,
+            metadata=aspect_content,
         )
-        
         if not success:
-            raise Exception("Failed to update aspect metadata")
-        
-        # Then promote the draft description to the actual description
-        client.accept_table_draft_description(table_fqn)
-        
-        logger.info("Draft description accepted and metadata updated successfully")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update aspect metadata",
+            )
+
         return {"message": "Table draft description accepted successfully"}
     except Exception as e:
-        logger.error("=== ERROR in accept_table_draft_description ===")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error(f"Error message: {str(e)}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail=str(e)
-        )
-    finally:
-        logger.info("=== END: accept_table_draft_description ===")
+        raise _handle_api_exception(e, "accept_table_draft_description")
+
 
 @app.post("/accept_column_draft_description")
 def accept_column_draft_description(
     client_options_settings: ClientOptionsSettings = Body(),
     client_settings: ClientSettings = Body(),
     table_settings: TableSettings = Body(),
-    dataset_settings: DatasetSettings = Body(),
-    column_settings: ColumnSettings = Body()
+    dataset_settings: DatasetSettings | None = Body(default=None),
+    column_settings: ColumnSettings = Body(),
 ):
-    """
-    Accepts the draft description for a column, promoting it to the actual column description.
-
-    Args:
-        client_options_settings: Configuration for the Dataplex client options.
-        client_settings: Project and location details.
-        table_settings: Table identifier information.
-        column_settings: Column identifier information.
-
-    Returns:
-        A message indicating success or failure.
-    """
+    """Accepts the draft description for a column, promoting it to the actual column description."""
     try:
-        client_options = ClientOptions(
-            use_lineage_tables=client_options_settings.use_lineage_tables,
-            use_lineage_processes=client_options_settings.use_lineage_processes,
-            use_profile=client_options_settings.use_profile,
-            use_data_quality=client_options_settings.use_data_quality,
-            use_ext_documents=client_options_settings.use_ext_documents,
-            persist_to_dataplex_catalog=client_options_settings.persist_to_dataplex_catalog,
-            stage_for_review=client_options_settings.stage_for_review,
-            description_handling=client_options_settings.description_handling,
-            description_prefix=client_options_settings.description_prefix
+        enforce_allowed_projects(
+            client_settings.project_id,
+            table_settings.project_id,
+            dataset_settings.project_id if dataset_settings else None,
         )
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-            client_options=client_options
-        )
-
-        table_fqn = f"{table_settings.project_id}.{table_settings.dataset_id}.{table_settings.table_id}"
+        _enforce_replace_policy(client_options_settings)
+        table_fqn = _require_table_fqn(table_settings)
         column_name = column_settings.column_name
-        logger.info(f"Accepting draft description for column {column_name} in table: {table_fqn}")
-        
-        # Promote the draft description to the actual description (Original essential logic)
-        client.accept_column_draft_description(table_fqn, column_name)
-        logger.info(f"Promoted draft description for column {column_name}")
-        
+
+        client_options = _build_client_options(client_options_settings)
+        client = _build_client(client_settings, client_options)
+
+        logger.info("Accepting draft description for column %s.%s", table_fqn, column_name)
+        accepted = client.accept_column_draft_description(table_fqn, column_name)
+        if not accepted:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to accept column draft description",
+            )
+
         return {"message": f"Column {column_name} draft description accepted successfully"}
     except Exception as e:
-        logger.exception("An error occurred while accepting column draft description") 
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
-        )
+        raise _handle_api_exception(e, "accept_column_draft_description")
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.error(f"HTTP error occurred: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    logger.info(f"Request: {request.method} {request.url}")
-    logger.debug(f"Headers: {request.headers}")
-    body = await request.body()
-    logger.debug(f"Body: {body.decode()}")
-    response = await call_next(request)
-    return response
-
-# Regeneration Management APIs
 @app.post("/get_regeneration_counts")
 def get_regeneration_counts(
     client_settings: ClientSettings = Body(),
     dataset_settings: DatasetSettings = Body(),
-    search_query: str = Body(None),
+    search_query: str | None = Body(default=None),
 ):
     try:
-        # Validate required parameters
-        if not client_settings.project_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="project_id is required"
-            )
-        if not client_settings.llm_location:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="llm_location is required"
-            )
-        if not client_settings.dataplex_location:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="dataplex_location is required"
-            )
-        if not dataset_settings.project_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="dataset_project_id is required"
-            )
-        if not dataset_settings.dataset_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="dataset_id is required for getting regeneration counts"
-            )
-            
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-        )
-        
-        dataset_fqn = f"{dataset_settings.project_id}.{dataset_settings.dataset_id}" 
-        logger.info(f"Getting regeneration counts for dataset: {dataset_fqn}")
-        
-        # Use _list_tables_in_dataset_for_regeneration to get tables marked for regeneration
-        tables = client._table_ops._list_tables_in_dataset_for_regeneration(dataset_fqn)
-        tables_count = len(tables)
-        
-        logger.info(f"Found {tables_count} tables marked for regeneration")
-        
-        return RegenerationCounts(
-            tables=tables_count,
-            columns=0  # TODO: Implement column counting
-        )
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error in get_regeneration_counts: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        enforce_allowed_projects(client_settings.project_id, dataset_settings.project_id)
+        dataset_fqn = _require_dataset_fqn(dataset_settings)
+        if search_query is not None:
+            cleaned_search = search_query.strip()
+            if cleaned_search and (
+                cleaned_search.upper() in {"AND", "OR", "NOT"}
+                or not _SEARCH_TERM_RE.match(cleaned_search)
+            ):
+                raise ValueError("Invalid search query filter.")
 
-# Add a GET endpoint for backward compatibility
+        client = _build_client(client_settings)
+        logger.info("Getting regeneration counts for dataset %s", dataset_fqn)
+        tables = client._table_ops._list_tables_in_dataset_for_regeneration(dataset_fqn)
+        return RegenerationCounts(tables=len(tables), columns=0)
+    except Exception as e:
+        raise _handle_api_exception(e, "get_regeneration_counts")
+
+
 @app.get("/get_regeneration_counts")
 def get_regeneration_counts_get(
     project_id: str,
@@ -542,30 +894,28 @@ def get_regeneration_counts_get(
     dataplex_location: str,
     dataset_project_id: str,
     dataset_id: str,
-    search_query: str = None,
+    search_query: str | None = None,
 ):
-    logger.info(f"GET request received for get_regeneration_counts, converting to POST format")
-    
-    # Create the objects expected by the POST endpoint
-    client_settings = ClientSettings(
-        project_id=project_id,
-        llm_location=llm_location,
-        dataplex_location=dataplex_location
-    )
-    
-    dataset_settings = DatasetSettings(
-        project_id=dataset_project_id,
-        dataset_id=dataset_id,
-        documentation_csv_uri="",  # Required by the model but not used for this endpoint
-        strategy=""  # Required by the model but not used for this endpoint
-    )
-    
-    # Call the POST endpoint handler
-    return get_regeneration_counts(
-        client_settings=client_settings,
-        dataset_settings=dataset_settings,
-        search_query=search_query
-    )
+    try:
+        client_settings = ClientSettings(
+            project_id=project_id,
+            llm_location=llm_location,
+            dataplex_location=dataplex_location,
+        )
+        dataset_settings = DatasetSettings(
+            project_id=dataset_project_id,
+            dataset_id=dataset_id,
+            documentation_csv_uri=None,
+            strategy="NAIVE",
+        )
+        return get_regeneration_counts(
+            client_settings=client_settings,
+            dataset_settings=dataset_settings,
+            search_query=search_query,
+        )
+    except Exception as e:
+        raise _handle_api_exception(e, "get_regeneration_counts_get")
+
 
 @app.post("/regenerate_selected")
 def regenerate_selected(
@@ -575,48 +925,70 @@ def regenerate_selected(
     regeneration_request: RegenerationRequest = Body(),
 ):
     try:
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-            client_options=ClientOptions(**client_options_settings.dict())
-        )
-        
-        dataset_fqn = f"{dataset_settings.project_id}.{dataset_settings.dataset_id}"
+        enforce_allowed_projects(client_settings.project_id, dataset_settings.project_id)
+        for obj in regeneration_request.objects:
+            if _TABLE_FQN_RE.match(obj):
+                enforce_allowed_projects(obj.split(".", 1)[0])
+        _enforce_generation_policy(client_options_settings)
+        dataset_fqn = _require_dataset_fqn(dataset_settings)
+
+        client_options = _build_client_options(client_options_settings)
+        client_options._regenerate = True
+        client_options._use_human_comments = True
+        client = _build_client(client_settings, client_options)
+
         search_query = regeneration_request.objects[0] if regeneration_request.objects else None
-        
-        logger.info(f"Processing regeneration for dataset: {dataset_fqn} with filter: {search_query}")
-        
-        # Use the utility method to build the effective query
-        # This ensures the dataset_fqn is always included in the query
-        effective_query = client._review_ops.build_search_query_for_regeneration(dataset_fqn, search_query)
-        logger.info(f"Final query for review items: {effective_query}")
-        
-        # Get all items matching the pattern
-        matching_items = client._review_ops.get_review_items_for_dataset(dataset_fqn, effective_query)
-        items = matching_items.get("data", {}).get("items", [])
-        
-        logger.info(f"Found {len(items)} items matching filter")
-        
+
+        effective_query = client._review_ops.build_search_query_for_regeneration(
+            dataset_fqn, search_query
+        )
+        catalog_client = client._cloud_clients[constants["CLIENTS"]["DATAPLEX_CATALOG"]]
+        max_tables = get_max_tables_per_request()
+        search_request = dataplex_v1.SearchEntriesRequest(
+            name=f"projects/{client._project_id}/locations/global",
+            query=effective_query,
+            page_size=max_tables,
+        )
+        search_results = catalog_client.search_entries(request=search_request)
+
         results = []
-        for item in items:
-            item_name = item.get("name", "")
-            logger.info(f"Regenerating item: {item_name}")
-            
-            # TODO: Implement actual regeneration logic here
-            # This is a placeholder - you'll need to implement the actual regeneration
-            # based on your application's requirements
-            
-            results.append({"object": item_name, "status": "regenerated"})
-        
+        previews = []
+        for entry_result in search_results:
+            entry = getattr(entry_result, "dataplex_entry", None)
+            fqn = getattr(entry, "fully_qualified_name", "") if entry else ""
+            if not fqn.startswith("bigquery:"):
+                continue
+            table_fqn = fqn.replace("bigquery:", "", 1)
+            tbl_project, tbl_dataset, _ = _validate_table_fqn(table_fqn)
+            if f"{tbl_project}.{tbl_dataset}" != dataset_fqn:
+                continue
+            enforce_allowed_projects(tbl_project)
+
+            if len(results) >= max_tables:
+                raise ValueError(
+                    f"Dataset operation exceeds maximum tables per request ({max_tables})."
+                )
+
+            res = client.generate_table_description(table_fqn)
+            results.append(
+                {
+                    "object": table_fqn,
+                    "status": "dry_run" if client_options_settings.dry_run else "regenerated",
+                }
+            )
+            if client_options_settings.dry_run:
+                previews.append(res)
+
+        if client_options_settings.dry_run:
+            return {
+                "message": "Dry-run selective regeneration preview generated successfully",
+                "dry_run": True,
+                "preview": {"dataset": dataset_fqn, "tables": previews},
+            }
         return {"regenerated_objects": results}
     except Exception as e:
-        logger.error(f"Error in regenerate_selected: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "regenerate_selected")
+
 
 @app.post("/regenerate_all")
 def regenerate_all(
@@ -625,44 +997,39 @@ def regenerate_all(
     dataset_settings: DatasetSettings = Body(),
 ):
     try:
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-            client_options=ClientOptions(**client_options_settings.dict())
-        )
-        
-        dataset_fqn = f"{dataset_settings.project_id}.{dataset_settings.dataset_id}"
-        logger.info(f"Regenerating all marked items in dataset: {dataset_fqn}")
-        
-        # Set regeneration flag to True
-        client._client_options._regenerate = True
-        
-        # Call generate_dataset_tables_columns_descriptions with regeneration flag
+        enforce_allowed_projects(client_settings.project_id, dataset_settings.project_id)
+        _enforce_generation_policy(client_options_settings)
+        dataset_fqn = _require_dataset_fqn(dataset_settings)
+
+        client_options = _build_client_options(client_options_settings)
+        client_options._regenerate = True
+        client = _build_client(client_settings, client_options)
+
+        logger.info("Regenerating all marked items in dataset %s", dataset_fqn)
         result = client.regenerate_dataset_tables_columns_descriptions(
             dataset_fqn=dataset_fqn,
             strategy=dataset_settings.strategy,
-            documentation_csv_uri=dataset_settings.documentation_csv_uri
+            documentation_csv_uri=dataset_settings.documentation_csv_uri,
         )
-        
-        # Reset regeneration flag
         client._client_options._regenerate = False
-        
+
+        if client_options_settings.dry_run:
+            return {
+                "message": "Dry-run regeneration preview generated successfully",
+                "dry_run": True,
+                "preview": result,
+            }
         return {"message": "All marked items (tables and columns) regenerated successfully"}
     except Exception as e:
-        logger.error(f"Error in regenerate_all: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "regenerate_all")
 
-# Review Management Models
+
 class Comment(BaseModel):
     id: str
     text: str
     type: str
     timestamp: str
+
 
 class MetadataItem(BaseModel):
     id: str
@@ -676,114 +1043,60 @@ class MetadataItem(BaseModel):
     comments: list[Comment]
     markedForRegeneration: bool = False
 
-# Review Management APIs
+
 @app.post("/metadata/review")
 def get_review_items(
     client_settings: ClientSettings = Body(),
     dataset_settings: DatasetSettings = Body(),
 ):
     try:
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-        )
-        
-        # Only validate project_id
-        if not dataset_settings.project_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="project_id must be provided"
-            )
-        
-        try:
-            # Get all review items for the project, optionally filtered by dataset
-        
-            
-            logger.info(f"Getting review items for project {dataset_settings.project_id}")
-                
-            # --- START: Fix dataset_fqn construction and handling --- 
-            # Construct the full dataset FQN if dataset_id is provided
-            dataset_fqn = None
-            if dataset_settings.dataset_id:
-                dataset_fqn = f"{dataset_settings.project_id}.{dataset_settings.dataset_id}"
-                logger.info(f"Constructed dataset FQN: {dataset_fqn}")
+        enforce_allowed_projects(client_settings.project_id, dataset_settings.project_id)
+
+        dataset_fqn = None
+        if dataset_settings.dataset_id:
+            dataset_fqn = f"{dataset_settings.project_id}.{dataset_settings.dataset_id}"
+
+        client = _build_client(client_settings)
+        result = client._review_ops.get_review_items_for_dataset(dataset_fqn=dataset_fqn)
+
+        raw_items = []
+        if isinstance(result, dict):
+            if "data" in result and isinstance(result["data"], dict):
+                raw_items = result["data"].get("items", [])
             else:
-                logger.info(f"No specific dataset ID provided, fetching for project: {dataset_settings.project_id}")
-                # Assuming None signifies fetching for the whole project
-                # Adjust if the underlying library function expects something else (e.g., project_id)
-            
-            # Call the underlying function with the potentially None dataset_fqn
-            result = client._review_ops.get_review_items_for_dataset(dataset_fqn=dataset_fqn)
-            # --- END: Fix dataset_fqn construction and handling ---
-            
-            logger.info(f"Raw result from review_ops: {result}")
-            
-            # --- Start of added filtering logic ---
-            # Ensure result is a dictionary and has 'items'
+                raw_items = result.get("items", [])
+
+        if not isinstance(raw_items, list):
             raw_items = []
-            if isinstance(result, dict):
-                if "data" in result and isinstance(result["data"], dict):
-                     # Handle potential extra 'data' wrapper
-                     raw_items = result["data"].get("items", [])
-                else:
-                     raw_items = result.get("items", [])
-            
-            if not isinstance(raw_items, list):
-                logger.warning(f"Unexpected format for items in review result: {type(raw_items)}")
-                raw_items = []
 
-            # Filter out items that have been accepted
-            filtered_items = []
-            for item in raw_items:
-                if isinstance(item, dict):
-                    # Check the 'metadata' field within the item for 'is-accepted'
-                    # Adjust path based on actual structure if needed
-                    review_metadata = item.get("metadata", {})
-                    if isinstance(review_metadata, dict) and review_metadata.get("is-accepted") is True:
-                        logger.info(f"Filtering out accepted item: {item.get('id', 'N/A')}")
-                        continue # Skip this item
-                    filtered_items.append(item)
-                else:
-                    logger.warning(f"Skipping non-dict item in review list: {item}")
+        allowed_projects = get_allowed_projects()
+        filtered_items = []
+        for item in raw_items:
+            if isinstance(item, dict):
+                review_metadata = item.get("metadata", {})
+                if isinstance(review_metadata, dict) and review_metadata.get("is-accepted") is True:
+                    continue
+                if allowed_projects is not None:
+                    item_id = str(item.get("id", ""))
+                    item_fqn = item_id.split("#", 1)[0] if "#" in item_id else str(item.get("name", ""))
+                    item_project = item_fqn.split(".", 1)[0] if "." in item_fqn else ""
+                    if not item_project or item_project not in allowed_projects:
+                        continue
+                filtered_items.append(item)
 
-            total_count_before_filter = len(raw_items)
-            total_count_after_filter = len(filtered_items)
-            logger.info(f"Filtered review items: {total_count_before_filter} -> {total_count_after_filter}")
-            # --- End of added filtering logic ---
+        if not isinstance(result, dict):
+            result = {"items": [], "nextPageToken": None, "totalCount": 0}
+        if isinstance(result, dict) and "data" in result and isinstance(result["data"], dict):
+            result = result["data"]
 
-            # Ensure we always return a properly structured response
-            if not isinstance(result, dict):
-                result = {"items": [], "nextPageToken": None, "totalCount": 0}
-            
-            # If result has a "data" wrapper, unwrap it
-            if isinstance(result, dict) and "data" in result:
-                result = result["data"]
-            
-            # Ensure all required fields are present using the *filtered* items
-            response_data = {
-                "items": filtered_items, # Use filtered list
-                "nextPageToken": result.get("nextPageToken", None), # Keep original token
-                "totalCount": total_count_after_filter # Use count after filtering
-            }
-            
-            logger.info(f"Structured response data: {response_data}")
-            return response_data
-            
-        except Exception as e:
-            logger.error(f"Error getting review items: {str(e)}")
-            return {
-                "items": [],
-                "nextPageToken": None,
-                "totalCount": 0
-            }
-            
+        return {
+            "items": filtered_items,
+            "nextPageToken": result.get("nextPageToken", None),
+            "totalCount": len(filtered_items),
+        }
     except Exception as e:
-        logger.error(f"Error in get_review_items: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "get_review_items")
+
 
 @app.post("/metadata/review/{id}/reject")
 def reject_review_item(
@@ -791,20 +1104,21 @@ def reject_review_item(
     client_settings: ClientSettings = Body(),
 ):
     try:
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-        )
-        
+        _, table_fqn, _ = _parse_review_item_id(id)
+        target_project, _, _ = _validate_table_fqn(table_fqn)
+        enforce_allowed_projects(client_settings.project_id, target_project)
+
+        client = _build_client(client_settings)
         result = client.reject_review_item(id)
+        if isinstance(result, dict) and result.get("success") is False:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to reject review item",
+            )
         return {"status": "rejected", "id": id, **result}
     except Exception as e:
-        logger.error(f"Error in reject_review_item: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "reject_review_item")
+
 
 @app.post("/metadata/review/{id}/edit")
 def edit_review_item(
@@ -813,20 +1127,31 @@ def edit_review_item(
     description: str = Body(..., embed=True),
 ):
     try:
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
+        item_type, table_fqn, _ = _parse_review_item_id(id)
+        target_project, _, _ = _validate_table_fqn(table_fqn)
+        enforce_allowed_projects(client_settings.project_id, target_project)
+
+        if not isinstance(description, str):
+            raise ValueError("Description must be a string.")
+        max_len = (
+            constants["DATA"]["MAX_TABLE_DESC_LENGTH"]
+            if item_type == "table"
+            else constants["DATA"]["MAX_COLUMN_DESC_LENGTH"]
         )
-        
+        if len(description) > max_len:
+            raise ValueError("Description exceeds maximum allowed length.")
+
+        client = _build_client(client_settings)
         result = client.edit_review_item(id, description)
+        if isinstance(result, dict) and result.get("success") is False:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to edit review item",
+            )
         return {"status": "updated", "id": id, **result}
     except Exception as e:
-        logger.error(f"Error in edit_review_item: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "edit_review_item")
+
 
 @app.post("/metadata/review/{id}/comment")
 def add_review_comment(
@@ -835,293 +1160,208 @@ def add_review_comment(
     comment: str = Body(..., embed=True),
 ):
     try:
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-        )
-        
-        # TODO: Implement comment logic
+        item_type, table_fqn, column_name = _parse_review_item_id(id)
+        target_project, _, _ = _validate_table_fqn(table_fqn)
+        enforce_allowed_projects(client_settings.project_id, target_project)
+
+        if not isinstance(comment, str) or not comment.strip():
+            raise ValueError("Comment must be a non-empty string.")
+        if len(comment) > _MAX_COMMENT_LENGTH:
+            raise ValueError("Comment exceeds maximum allowed length.")
+        clean_comment = sanitize_llm_output(comment, max_chars=_MAX_COMMENT_LENGTH)
+        if not clean_comment:
+            raise ValueError("Comment must be a non-empty string.")
+
+        client = _build_client(client_settings)
+        if item_type == "column":
+            success = client.add_comment_to_column_draft_description(
+                table_fqn, column_name, clean_comment
+            )
+        else:
+            success = client.add_comment_to_table_draft_description(table_fqn, clean_comment)
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to add comment",
+            )
+
         return {
             "status": "added",
             "id": id,
             "comment": {
-                "id": "new_comment_id",
-                "text": comment,
+                "id": str(uuid.uuid4()),
+                "text": clean_comment,
                 "type": "human",
-                "timestamp": datetime.datetime.now().isoformat()
-            }
+                "timestamp": datetime.datetime.now().isoformat(),
+            },
         }
     except Exception as e:
-        logger.error(f"Error in add_review_comment: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "add_review_comment")
+
 
 @app.post("/mark_for_regeneration")
 def mark_for_regeneration(
     client_settings: ClientSettings = Body(),
     request: MarkForRegenerationRequest = Body(),
 ):
-    """Mark a table or column for regeneration.
-
-    If column_name is provided, marks the specific column for regeneration.
-    If only table_fqn is provided, marks the entire table for regeneration.
-    """
+    """Mark a table or column for regeneration."""
     try:
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-        )
-        
+        target_project, _, _ = _validate_table_fqn(request.table_fqn)
+        enforce_allowed_projects(client_settings.project_id, target_project)
+
+        client = _build_client(client_settings)
         if request.column_name:
             success = client.mark_column_for_regeneration(request.table_fqn, request.column_name)
             if success:
-                return {"message": f"Column {request.column_name} in table {request.table_fqn} marked for regeneration"}
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to mark column {request.column_name} for regeneration"
-                )
-        else:
-            success = client.mark_table_for_regeneration(request.table_fqn)
-            if success:
-                return {"message": f"Table {request.table_fqn} marked for regeneration"}
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to mark table {request.table_fqn} for regeneration"
-                )
-    except Exception as e:
-        logger.error(f"Error in mark_for_regeneration: {str(e)}")
+                return {
+                    "message": f"Column {request.column_name} in table {request.table_fqn} marked for regeneration"
+                }
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to mark column for regeneration",
+            )
+
+        success = client.mark_table_for_regeneration(request.table_fqn)
+        if success:
+            return {"message": f"Table {request.table_fqn} marked for regeneration"}
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            detail="Failed to mark table for regeneration",
         )
+    except Exception as e:
+        raise _handle_api_exception(e, "mark_for_regeneration")
+
 
 @app.post("/metadata/review/details")
 def get_review_item_details(
     client_settings: ClientSettings = Body(),
     table_settings: TableSettings = Body(),
-    column_name: str = Body(None),
+    column_name: str | None = Body(default=None),
 ):
-    """Get detailed information about a review item.
-    
-    Args:
-        client_settings: Project and location details
-        table_settings: Table identifier information
-        column_name: Optional column name. If provided, returns column details
-    
-    Returns:
-        Detailed information about the review item
-    """
+    """Get detailed information about a review item."""
+    table_fqn = None
     try:
-        logger.info(f"Getting details for table: {table_settings.project_id}.{table_settings.dataset_id}.{table_settings.table_id}")
+        enforce_allowed_projects(client_settings.project_id, table_settings.project_id)
+        table_fqn = _require_table_fqn(table_settings)
+        if column_name is not None:
+            column_name = column_name.strip() or None
+            if column_name is not None:
+                validate_column_name(column_name)
+
+        client = _build_client(client_settings)
         if column_name:
-            logger.info(f"Column: {column_name}")
-        
-        client = Client(
-            project_id=client_settings.project_id,
-            llm_location=client_settings.llm_location,
-            dataplex_location=client_settings.dataplex_location,
-        )
-        
-        table_fqn = f"{table_settings.project_id}.{table_settings.dataset_id}.{table_settings.table_id}"
-        
-        if column_name:
-            # Get column details
             details = client.get_review_item_details(table_fqn, column_name)
         else:
-            # Get table details
             details = client.get_review_item_details(table_fqn)
-            
-        if not details:
-            raise ValueError(f"No details found for {'column ' + column_name if column_name else 'table'} {table_fqn}")
-        
-        # --- Add logging before returning --- START
-        # logger.info(f"Returning details to frontend: {details}") # Commented out this line
-        # --- Add logging before returning --- END
-        
-        # Return the details directly without wrapping in data field
-        return details
 
+        if not details:
+            raise NotFound(message="Review item not found")
+
+        return details
     except Exception as e:
-        logger.error(f"Error getting review item details for table {table_fqn} column {column_name}: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "get_review_item_details")
+
 
 @app.post("/update_table_draft_description")
-async def update_table_draft_description(request: Request, update_request: UpdateDraftDescriptionRequest):
-    """Update the draft description for a table.
-    
-    Args:
-        request: The raw request object for logging
-        update_request: Request containing client settings, table settings, and the new description
-    
-    Returns:
-        A dictionary with the status of the update operation
-    """
+def update_table_draft_description(update_request: UpdateDraftDescriptionRequest):
+    """Update the draft description for a table."""
     try:
-        # Log the raw request body
-        body = await request.body()
-        logger.info("=== START: update_table_draft_description ===")
-        logger.info(f"Raw request body: {body.decode()}")
-        logger.info(f"Parsed request: {update_request.dict()}")
-        
-        client = Client(
-            project_id=update_request.client_settings.project_id,
-            llm_location=update_request.client_settings.llm_location,
-            dataplex_location=update_request.client_settings.dataplex_location
+        enforce_allowed_projects(
+            update_request.client_settings.project_id,
+            update_request.table_settings.project_id,
         )
-        
-        # Construct the table FQN
-        table_fqn = f"{update_request.table_settings.project_id}.{update_request.table_settings.dataset_id}.{update_request.table_settings.table_id}"
-        logger.info(f"Constructed table FQN: {table_fqn}")
-        
-        # Update the draft description
-        logger.info(f"Updating draft description. Length: {len(update_request.description)}")
-        logger.info(f"Is HTML: {update_request.is_html}")
-        
+        table_fqn = _require_table_fqn(update_request.table_settings)
+
+        client = _build_client(update_request.client_settings)
+        logger.info(
+            "Updating draft description for %s (len=%d, is_html=%s)",
+            table_fqn,
+            len(update_request.description),
+            update_request.is_html,
+        )
+
         success = client._dataplex_ops.update_table_draft_description(
             table_fqn=table_fqn,
-            description=update_request.description
+            description=update_request.description,
         )
-        
         if success:
-            logger.info("Draft description updated successfully")
             return {
                 "status": "success",
-                "message": "Draft description updated successfully"
+                "message": "Draft description updated successfully",
             }
-        else:
-            logger.error("Failed to update draft description (returned False)")
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to update draft description"
-            )
-        
-    except ValidationError as e:
-        # Log validation errors in detail
-        logger.error("=== Validation Error ===")
-        logger.error(f"Error details: {e.errors()}")
-        logger.error(f"Error JSON: {e.json()}")
         raise HTTPException(
-            status_code=422,
-            detail=f"Validation error: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update draft description",
         )
     except Exception as e:
-        logger.error("=== Error in update_table_draft_description ===")
-        logger.error(f"Error type: {type(e).__name__}")
-        logger.error(f"Error message: {str(e)}")
-        logger.error(f"Traceback:\n{traceback.format_exc()}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to update draft description: {str(e)}"
-        )
-    finally:
-        logger.info("=== END: update_table_draft_description ===")
+        raise _handle_api_exception(e, "update_table_draft_description")
+
 
 @app.post("/metadata/review/add_comment")
 def add_comment(request: AddCommentRequest):
-    """Add a comment to a table or column's draft description.
-    
-    Args:
-        request: Contains client settings, table settings, and the comment to add
-    
-    Returns:
-        The newly added comment text
-    """
+    """Add a comment to a table or column's draft description."""
     try:
-        logger.info("=== START: add_comment ===")
-        client = Client(
-            project_id=request.client_settings.project_id,
-            llm_location=request.client_settings.llm_location,
-            dataplex_location=request.client_settings.dataplex_location,
+        enforce_allowed_projects(
+            request.client_settings.project_id,
+            request.table_settings.project_id,
         )
-        
-        table_fqn = f"{request.table_settings.project_id}.{request.table_settings.dataset_id}.{request.table_settings.table_id}"
-        logger.info(f"Adding comment to table: {table_fqn}")
-        
+        table_fqn = _require_table_fqn(request.table_settings)
+
+        client = _build_client(request.client_settings)
         if request.column_name:
-            success = client.add_comment_to_column_draft_description(table_fqn, request.column_name, request.comment)
+            success = client.add_comment_to_column_draft_description(
+                table_fqn, request.column_name, request.comment
+            )
         else:
             success = client.add_comment_to_table_draft_description(table_fqn, request.comment)
-            
+
         if not success:
-            logger.error("Failed to add comment")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to add comment"
+                detail="Failed to add comment",
             )
-            
-        logger.info("Comment added successfully")
+
         return {"comment": request.comment}
-        
     except Exception as e:
-        logger.error(f"Error adding comment: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
-    finally:
-        logger.info("=== END: add_comment ===")
+        raise _handle_api_exception(e, "add_comment")
+
 
 @app.post("/metadata/review/add_negative_example")
 def add_negative_example(request: AddNegativeExampleRequest):
-    """Add a negative example to a table's draft description.
-    
-    Args:
-        request: Contains client settings, table settings, and the negative example to add
-    
-    Returns:
-        The newly added negative example text
-    """
+    """Add a negative example to a table's draft description."""
     try:
-        client = Client(
-            project_id=request.client_settings.project_id,
-            llm_location=request.client_settings.llm_location,
-            dataplex_location=request.client_settings.dataplex_location,
+        enforce_allowed_projects(
+            request.client_settings.project_id,
+            request.table_settings.project_id,
         )
-        
-        table_fqn = f"{request.table_settings.project_id}.{request.table_settings.dataset_id}.{request.table_settings.table_id}"
-        
-        # Get existing aspect
+        table_fqn = _require_table_fqn(request.table_settings)
+
+        client = _build_client(request.client_settings)
         existing_comments = client.get_comments_to_table_draft_description(table_fqn) or []
-        existing_negative_examples = client.get_negative_examples_to_table_draft_description(table_fqn) or []
-        
-        # Add to existing examples
+        existing_negative_examples = list(
+            client.get_negative_examples_to_table_draft_description(table_fqn) or []
+        )
         existing_negative_examples.append(request.example)
-        
-        # Update aspect with new metadata
+
         aspect_content = {
             "negative-examples": existing_negative_examples,
-            "human-comments": existing_comments
+            "human-comments": existing_comments,
         }
-        
+        details = client.get_review_item_details(table_fqn)
+        draft_description = (details or {}).get("draftDescription", "")
+
         success = client._dataplex_ops.update_table_draft_description(
             table_fqn=table_fqn,
-            description=client._review_ops.get_review_item_details(table_fqn)["draftDescription"],
-            metadata=aspect_content
+            description=draft_description,
+            metadata=aspect_content,
         )
-        
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to add negative example"
+                detail="Failed to add negative example",
             )
-            
+
         return {"example": request.example}
-        
     except Exception as e:
-        logger.error(f"Error adding negative example: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise _handle_api_exception(e, "add_negative_example")

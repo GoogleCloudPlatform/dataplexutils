@@ -20,6 +20,7 @@ from .version import __version__
 
 # Standard library imports
 import logging
+import os
 import toml
 import pkgutil
 
@@ -53,15 +54,32 @@ class Client:
         llm_location: str,
         dataplex_location: str,
         client_options: ClientOptions = None,
+        llm_project_id: str | None = None,
     ):
         if client_options:
             self._client_options = client_options
         else:
             self._client_options = ClientOptions()
-            
+
+        self._utils = MetadataUtils(self)
+        self._utils.validate_project_id(project_id)
+        self._utils.validate_location(llm_location)
+        self._utils.validate_location(dataplex_location)
+
+        if llm_project_id is not None and not isinstance(llm_project_id, str):
+            raise ValueError("Invalid llm_project_id.")
+        resolved_llm_project = (
+            (llm_project_id or "").strip()
+            or os.environ.get("METADATA_WIZARD_LLM_PROJECT_ID", "").strip()
+            or project_id
+        )
+        self._utils.validate_project_id(resolved_llm_project)
+
         self._project_id = project_id
+        self._llm_project_id = resolved_llm_project
         self._dataplex_location = dataplex_location
         self.llm_location = llm_location
+        self._llm_calls_count = 0
 
         # Initialize cloud clients
         self._cloud_clients = {
@@ -72,12 +90,15 @@ class Client:
         }
 
         # Initialize operation classes
-        self._utils = MetadataUtils(self)
         self._table_ops = TableOperations(self)
         self._column_ops = ColumnOperations(self)
         self._dataplex_ops = DataplexOperations(self)
         self._bigquery_ops = BigQueryOperations(self)
         self._review_ops = ReviewOperations(self)
+
+    def reset_request_counters(self) -> None:
+        """Reset per-request resource usage counters."""
+        self._llm_calls_count = 0
 
     # Delegate all operations to appropriate operation classes
     def generate_dataset_tables_descriptions(self, dataset_fqn, strategy="NAIVE", documentation_csv_uri=None):
